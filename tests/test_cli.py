@@ -1,9 +1,11 @@
 import json
+import importlib.resources
 from types import SimpleNamespace
 
 from goalkeeper.calibration import calibrate_objective
-from goalkeeper.cli import main
-from goalkeeper.codex_adapter import PauseGoalResult, StartGoalResult
+from goalkeeper.cli import _app_server_goal_objective, main
+from goalkeeper.codex_adapter import AppServerCapabilityMatrix, PauseGoalResult, StartGoalResult
+from goalkeeper.contract import DEFAULT_MAX_GOAL_OBJECTIVE_CHARS
 from goalkeeper.ledger import GoalkeeperStore, new_checkpoint_id, utc_now
 from goalkeeper.models import Checkpoint
 
@@ -78,12 +80,60 @@ def test_watch_once_without_sdk_prints_manual_instructions(tmp_path, capsys):
     assert "Automatic watch is unavailable" in output
 
 
-def test_doctor_does_not_crash(tmp_path, capsys):
+def test_doctor_default_is_passive(tmp_path, capsys, monkeypatch):
+    calls = []
+
+    def fake_probe(*, cwd=None, live_probe=False, codex_bin=None):
+        calls.append(live_probe)
+        _ = (cwd, codex_bin)
+        return AppServerCapabilityMatrix(
+            codex_binary="codex",
+            app_server_available=True,
+            notes=[
+                "Live app-server goal probe skipped. Run `goalkeeper doctor --live-probe` "
+                "to verify true goal-control."
+            ],
+        )
+
+    monkeypatch.setattr("goalkeeper.doctor.inspect_app_server_capabilities", fake_probe)
+
     result = main(["doctor", "--cwd", str(tmp_path)])
 
     output = capsys.readouterr().out
     assert result == 0
+    assert calls == [False]
     assert "Goalkeeper doctor" in output
+    assert "true /goal control: unknown; run `goalkeeper doctor --live-probe`" in output
+
+
+def test_doctor_live_probe_is_opt_in(tmp_path, capsys, monkeypatch):
+    calls = []
+
+    def fake_probe(*, cwd=None, live_probe=False, codex_bin=None):
+        calls.append(live_probe)
+        _ = (cwd, codex_bin)
+        return AppServerCapabilityMatrix(
+            codex_binary="codex",
+            app_server_available=True,
+            initialize=True,
+            thread_start=True,
+            goal_get=True,
+            goal_set=True,
+            goal_pause=True,
+            goal_clear=True,
+            thread_read=True,
+            true_goal_control=True,
+            notes=["fake live probe succeeded"],
+        )
+
+    monkeypatch.setattr("goalkeeper.doctor.inspect_app_server_capabilities", fake_probe)
+
+    result = main(["doctor", "--cwd", str(tmp_path), "--live-probe"])
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert calls == [True]
+    assert "true /goal control: available" in output
 
 
 def test_watch_ledger_auto_pause_calls_app_server_adapter(tmp_path, capsys, monkeypatch):
@@ -166,7 +216,7 @@ def test_attach_true_goal_sets_goal_and_persists_thread(tmp_path, capsys, monkey
                 True,
                 True,
                 "fake true goal attached",
-                goal_id=thread_id,
+                goal_id=None,
                 thread_id=thread_id,
                 mode="true_goal",
                 final_response="thread_id=thread_123, status=active",
@@ -196,8 +246,163 @@ def test_attach_true_goal_sets_goal_and_persists_thread(tmp_path, capsys, monkey
     updated = store.load_contract(contract.id)
     assert result == 0
     assert updated.thread_id == "thread_123"
-    assert updated.goal_id == "thread_123"
+    assert updated.goal_id is None
     assert updated.status == "active"
     assert calls[0][0] == "thread_123"
     assert calls[0][2] == 123
     assert "fake true goal attached" in output
+
+
+def test_start_true_goal_persists_thread_without_fake_goal_id(tmp_path, capsys, monkeypatch):
+    class FakeAppServerAdapter:
+        def __init__(self, cwd=None):
+            self.cwd = cwd
+
+        def start_goal_thread(self, objective, *, cwd=None, token_budget=None):
+            _ = (objective, cwd, token_budget, self.cwd)
+            return StartGoalResult(
+                True,
+                True,
+                "fake true goal started",
+                goal_id=None,
+                thread_id="thread_123",
+                mode="true_goal",
+                final_response="thread_id=thread_123, goal_id=unavailable, status=active",
+            )
+
+    monkeypatch.setattr("goalkeeper.cli.CodexAppServerJsonRpcAdapter", FakeAppServerAdapter)
+
+    result = main(["start", "add health endpoint", "--cwd", str(tmp_path), "--true-goal"])
+
+    output = capsys.readouterr().out
+    contract = GoalkeeperStore(tmp_path).load_contract(_first_contract_id(tmp_path))
+    assert result == 0
+    assert contract.thread_id == "thread_123"
+    assert contract.goal_id is None
+    assert "fake true goal started" in output
+
+
+def test_package_skill_asset_exists():
+    asset = importlib.resources.files("goalkeeper").joinpath(
+        "assets",
+        "skills",
+        "goalkeeper",
+        "SKILL.md",
+    )
+
+    assert asset.is_file()
+    assert "Goalkeeper Skill" in asset.read_text(encoding="utf-8")
+
+
+def test_install_skill_copies_skill(tmp_path, capsys):
+    target = tmp_path / "skills"
+
+    result = main(["install-skill", "--target", str(target)])
+
+    output = capsys.readouterr().out
+    installed = target / "goalkeeper" / "SKILL.md"
+    assert result == 0
+    assert installed.exists()
+    assert "Installed Goalkeeper skill" in output
+    assert "Goalkeeper Skill" in installed.read_text(encoding="utf-8")
+
+
+def test_start_assume_defaults_turns_pending_contract_active(tmp_path, capsys):
+    result = main(
+        [
+            "start",
+            "migrate auth provider",
+            "--cwd",
+            str(tmp_path),
+            "--assume-defaults",
+            "--dry-run",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    contract_id = _first_contract_id(tmp_path)
+    contract = GoalkeeperStore(tmp_path).load_contract(contract_id)
+    assert result == 0
+    assert contract.status == "active"
+    assert not any(question.critical for question in contract.questions)
+    assert any("Assumed Q_FALLBACK default" in item for item in contract.assumptions)
+    assert "Assumed defaults for 1 question(s)." in output
+
+
+def test_answer_records_answer_and_clears_critical_question(tmp_path, capsys):
+    assert main(["prepare", "migrate auth provider", "--cwd", str(tmp_path)]) == 0
+    contract_id = _first_contract_id(tmp_path)
+
+    result = main(
+        [
+            "answer",
+            "--contract-id",
+            contract_id,
+            "--cwd",
+            str(tmp_path),
+            "--answer",
+            "Q_FALLBACK=keep fallback",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    contract = GoalkeeperStore(tmp_path).load_contract(contract_id)
+    assert result == 0
+    assert contract.status == "active"
+    assert not any(question.critical for question in contract.questions)
+    assert "Answered Q_FALLBACK: keep fallback" in contract.assumptions
+    assert f"goalkeeper start --contract-id {contract_id} --true-goal" in output
+
+
+def test_start_from_existing_contract_does_not_create_new_contract(tmp_path, capsys):
+    assert main(["prepare", "add health endpoint", "--cwd", str(tmp_path)]) == 0
+    contract_id = _first_contract_id(tmp_path)
+
+    result = main(
+        [
+            "start",
+            "--contract-id",
+            contract_id,
+            "--cwd",
+            str(tmp_path),
+            "--dry-run",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    contracts = sorted((tmp_path / ".goalkeeper" / "contracts").glob("*.json"))
+    assert result == 0
+    assert len(contracts) == 1
+    assert "Goalkeeper contract loaded" in output
+    assert contract_id in output
+
+
+def test_start_from_existing_pending_contract_is_deferred(tmp_path, capsys):
+    assert main(["prepare", "migrate auth provider", "--cwd", str(tmp_path)]) == 0
+    contract_id = _first_contract_id(tmp_path)
+
+    result = main(
+        [
+            "start",
+            "--contract-id",
+            contract_id,
+            "--cwd",
+            str(tmp_path),
+            "--dry-run",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert result == 2
+    assert "Start deferred" in output
+
+
+def test_app_server_goal_objective_uses_default_limit(tmp_path):
+    contract = calibrate_objective("add audit logging", cwd=tmp_path)
+    path = tmp_path / "contract.json"
+
+    objective = _app_server_goal_objective(contract, path)
+
+    assert DEFAULT_MAX_GOAL_OBJECTIVE_CHARS == 4000
+    assert objective.startswith("Read the Goalkeeper contract at ")
+    assert str(path.resolve()) in objective

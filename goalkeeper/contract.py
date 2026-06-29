@@ -5,7 +5,7 @@ from pathlib import Path
 from .models import GoalkeeperContract
 
 
-DEFAULT_MAX_GOAL_COMMAND_CHARS = 8000
+DEFAULT_MAX_GOAL_OBJECTIVE_CHARS = 4000
 
 
 def render_contract(contract: GoalkeeperContract) -> str:
@@ -97,7 +97,7 @@ def paste_ready_goal(
     contract: GoalkeeperContract,
     *,
     contract_path: str | Path | None = None,
-    max_chars: int = DEFAULT_MAX_GOAL_COMMAND_CHARS,
+    max_chars: int = DEFAULT_MAX_GOAL_OBJECTIVE_CHARS,
 ) -> str:
     command = f"/goal {render_contract(contract)}"
     if len(command) <= max_chars:

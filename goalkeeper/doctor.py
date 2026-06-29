@@ -22,14 +22,22 @@ class DoctorReport:
     sdk: CodexCapabilityMatrix
     app_server: AppServerCapabilityMatrix
     codex_binary: str | None
-    features: dict[str, bool]
+    features: dict[str, str]
+    live_probe: bool
 
 
-def collect_doctor_report(cwd: str | Path | None = None) -> DoctorReport:
+def collect_doctor_report(cwd: str | Path | None = None, *, live_probe: bool = False) -> DoctorReport:
     store = GoalkeeperStore(cwd)
     sdk = inspect_python_sdk_capabilities()
-    app_server = inspect_app_server_capabilities(cwd=str(store.root), live_probe=True)
+    app_server = inspect_app_server_capabilities(cwd=str(store.root), live_probe=live_probe)
     codex_binary = shutil.which("codex")
+    true_goal_control = (
+        "available"
+        if app_server.true_goal_control
+        else "unknown; run `goalkeeper doctor --live-probe`"
+        if app_server.app_server_available and not live_probe
+        else "unavailable"
+    )
     return DoctorReport(
         python_version=f"{platform.python_implementation()} {sys.version.split()[0]}",
         storage_location=store.storage_dir,
@@ -37,24 +45,24 @@ def collect_doctor_report(cwd: str | Path | None = None) -> DoctorReport:
         app_server=app_server,
         codex_binary=codex_binary,
         features={
-            "contract_generation": True,
-            "paste_ready_goal_prompt": True,
-            "sdk_run_mode": sdk.sdk_run_mode,
-            "sdk_thread_read": sdk.thread_read,
-            "app_server_json_rpc": app_server.app_server_available,
-            "true_goal_control": app_server.true_goal_control,
-            "app_server_goal_start": app_server.goal_set,
-            "app_server_goal_pause": app_server.goal_pause,
-            "app_server_goal_read": app_server.goal_get,
-            "auto_pause": app_server.goal_pause,
+            "contract_generation": "available",
+            "paste_ready_goal_prompt": "available",
+            "sdk_run_mode": _availability(sdk.sdk_run_mode),
+            "sdk_thread_read": _availability(sdk.thread_read),
+            "app_server_json_rpc": _availability(app_server.app_server_available),
+            "true_goal_control": true_goal_control,
+            "app_server_goal_start": _availability(app_server.goal_set),
+            "app_server_goal_pause": _availability(app_server.goal_pause),
+            "app_server_goal_read": _availability(app_server.goal_get),
+            "auto_pause": _availability(app_server.goal_pause),
         },
+        live_probe=live_probe,
     )
 
 
 def render_doctor_report(report: DoctorReport) -> str:
     feature_lines = "\n".join(
-        f"- {name.replace('_', ' ')}: {'available' if available else 'unavailable'}"
-        for name, available in report.features.items()
+        f"- {name.replace('_', ' ')}: {status}" for name, status in report.features.items()
     )
     codex_binary = report.codex_binary or "not found on PATH"
     sdk = "importable" if report.sdk.sdk_importable else "not importable"
@@ -63,6 +71,13 @@ def render_doctor_report(report: DoctorReport) -> str:
     goal_methods = ", ".join(report.sdk.goal_like_methods) or "none"
     notes = "\n".join(f"- {note}" for note in report.sdk.notes) or "- None."
     app_notes = "\n".join(f"- {note}" for note in report.app_server.notes) or "- None."
+    app_goal_control = (
+        "available"
+        if report.app_server.true_goal_control
+        else "unknown; run `goalkeeper doctor --live-probe`"
+        if report.app_server.app_server_available and not report.live_probe
+        else "unavailable"
+    )
     return f"""Goalkeeper doctor
 Python: {report.python_version}
 Storage: {report.storage_location}
@@ -98,7 +113,7 @@ Detected app-server JSON-RPC capabilities:
 - thread/goal/set pause: {'available' if report.app_server.goal_pause else 'unavailable'}
 - thread/goal/clear: {'available' if report.app_server.goal_clear else 'unavailable'}
 - thread/read: {'available' if report.app_server.thread_read else 'unavailable'}
-- true /goal control: {'available' if report.app_server.true_goal_control else 'unavailable'}
+- true /goal control: {app_goal_control}
 
 App-server notes:
 {app_notes}
@@ -108,3 +123,7 @@ Notes:
 - SDK run mode can run a normal Codex thread turn when available; it is not true /goal mode.
 - True goal start/watch/pause features use verified app-server JSON-RPC goal APIs when available.
 """
+
+
+def _availability(value: bool) -> str:
+    return "available" if value else "unavailable"

@@ -13,6 +13,10 @@ the time, very useful when the work starts drifting.
 Goalkeeper is not a fork of Codex. It does not patch Codex source. This MVP
 does not add a native `/goalkeeper` slash command.
 
+This is alpha software. It is useful, but intentionally conservative:
+true goal-control depends on local Codex app-server behavior, and supervision
+quality depends on checkpoints being recorded.
+
 ```bash
 goalkeeper start "refactor billing module without breaking public API" --true-goal
 ```
@@ -85,6 +89,19 @@ Prepare a contract:
 goalkeeper prepare "migrate auth provider but keep login compatible"
 ```
 
+If Goalkeeper asks critical questions, answer them:
+
+```bash
+goalkeeper answer --contract-id gk_example --answer Q_FALLBACK="keep fallback"
+goalkeeper start --contract-id gk_example --true-goal
+```
+
+Or deliberately accept the recommended defaults:
+
+```bash
+goalkeeper start "migrate auth provider but keep login compatible" --assume-defaults --true-goal
+```
+
 Start a true app-server goal when available:
 
 ```bash
@@ -129,6 +146,8 @@ under `.goalkeeper/contracts/`, and prints a paste-ready Codex `/goal`.
 
 Goalkeeper only asks targeted questions when the answer changes implementation.
 If a critical question remains, the contract is saved as `pending_questions`.
+Use `goalkeeper answer` to record answers, or `--assume-defaults` to accept
+Goalkeeper's recommended defaults as assumptions.
 
 ### `goalkeeper start "<objective>"`
 
@@ -143,6 +162,8 @@ goalkeeper start "<objective>" --thread-id <codex-thread-id> --true-goal
 goalkeeper start "<objective>" --true-goal
 goalkeeper start "<objective>" --dry-run
 goalkeeper start "<objective>" --sdk-run
+goalkeeper start --contract-id gk_abc123 --true-goal
+goalkeeper start "<objective>" --assume-defaults --true-goal
 goalkeeper start "<objective>" --max-no-progress-turns 3 --max-same-error-retries 2
 ```
 
@@ -154,6 +175,23 @@ methods: `thread/start`, `thread/goal/set`, `thread/goal/get`,
 
 `--sdk-run` is not true `/goal` mode. It runs the supervised contract as a
 normal Codex SDK thread turn when the SDK exposes `thread.run()`.
+
+Goalkeeper uses a conservative 4000-character default for inline generated
+goal objectives. If the rendered `/goal <contract>` would exceed that limit,
+it falls back to a short file reference.
+
+### `goalkeeper answer --contract-id <id> --answer Q_ID=value`
+
+Records answers for pending critical questions:
+
+```bash
+goalkeeper answer --contract-id gk_abc123 --answer Q_FALLBACK="keep fallback"
+goalkeeper start --contract-id gk_abc123 --true-goal
+```
+
+Answers are stored as assumptions, the original question remains in the
+contract for audit, and answered questions are marked non-critical. When no
+critical questions remain, the contract becomes `active`.
 
 ### `goalkeeper attach --contract-id <id> --thread-id <id>`
 
@@ -221,14 +259,30 @@ Marks the contract active again and attempts app-server resume when possible.
 
 ### `goalkeeper doctor`
 
-Checks the local environment:
+Checks the local environment passively:
 
 - Python version,
 - storage location,
 - `openai_codex` import status and detected version,
 - whether `codex` is on PATH,
 - SDK run-mode capabilities,
-- app-server JSON-RPC true goal-control capabilities.
+- app-server binary availability.
+
+The default command does not start Codex app-server and does not create probe
+threads:
+
+```bash
+goalkeeper doctor
+```
+
+To validate true app-server goal-control, opt in to the live probe:
+
+```bash
+goalkeeper doctor --live-probe
+```
+
+`--live-probe` may create a temporary persisted Codex thread, set a probe goal,
+pause it, clear it, and attempt to archive the probe thread.
 
 ### `goalkeeper install-skill`
 
@@ -242,6 +296,9 @@ goalkeeper install-skill --target C:\path\to\codex\skills
 
 Goalkeeper is conservative about Codex config paths. It does not guess a native
 installation location unless you provide one.
+
+The pip-installed package includes the skill asset, so `install-skill` works
+from both a source checkout and a `pip install git+...` installation.
 
 ## Codex Skill Usage
 
@@ -275,8 +332,8 @@ Goalkeeper writes a local contract and prints:
 </goalkeeper_contract>
 ```
 
-If the command would be too long, Goalkeeper saves the contract and prints a
-shorter goal:
+If the command would exceed the conservative 4000-character default, Goalkeeper
+saves the contract and prints a shorter goal:
 
 ```text
 /goal Read the Goalkeeper contract at <path> and pursue it exactly.
@@ -330,6 +387,10 @@ verified app-server methods:
 If the rendered contract is over 4000 characters, Goalkeeper stores the
 contract JSON locally and sends Codex a short objective that points to the
 contract path.
+
+The current app-server response may not expose a separate goal id. In that
+case Goalkeeper records the thread id for app-server operations and shows the
+goal id as unavailable instead of pretending the thread id is a goal id.
 
 If a Codex session was already started, use attach:
 
@@ -430,12 +491,15 @@ into checkpoints unless you want it persisted locally.
 
 ## Limitations
 
+- Goalkeeper is alpha/experimental.
 - Goalkeeper does not add a native `/goalkeeper` command.
 - Goalkeeper does not replace Codex `/goal`.
 - Contract-only mode cannot auto-pause or resume Codex.
 - SDK run mode is a normal SDK thread turn, not true `/goal` mode.
 - True goal-control depends on `codex app-server` and verified
   `thread/goal/*` JSON-RPC methods.
+- `goalkeeper doctor` is passive by default; `doctor --live-probe` can create
+  a temporary probe thread.
 - Auto-pause only works when app-server goal pause via `thread/goal/set`
   succeeds.
 - Watch mode is best-effort around Codex thread reading.

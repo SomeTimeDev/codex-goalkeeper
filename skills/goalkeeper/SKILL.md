@@ -22,14 +22,20 @@ Goalkeeper is a standalone personal companion tool. It does not add a native `/g
    goalkeeper prepare "<objective>"
    ```
 
-3. If Goalkeeper prints critical questions, ask only those questions. Keep the recommended defaults visible.
-4. After the user answers, run:
+3. If Goalkeeper prints critical questions, ask only those questions. Keep the recommended defaults visible. After the user answers, record them with:
 
    ```bash
-   goalkeeper start "<objective>" --true-goal
+   goalkeeper answer --contract-id <id> --answer Q_ID="answer"
    ```
 
-   Include `--cwd`, `--thread-id`, or `--token-budget` when the user provided them or the local task context clearly supplies them. Prefer `--true-goal` for normal Goalkeeper starts so the contract records a Codex thread id and can later support app-server pause/resume/watch. Use contract-only mode only when true goal-control is unavailable or the user asks for a paste-ready contract only. Use `--sdk-run` only when the user explicitly wants a normal Codex SDK thread run and understands that this is not native `/goal` mode.
+   If the user explicitly wants Goalkeeper defaults, use `--assume-defaults` on prepare/start instead of inventing answers.
+4. After questions are answered or defaults are assumed, run:
+
+   ```bash
+   goalkeeper start --contract-id <id> --true-goal
+   ```
+
+   Include `--cwd`, `--thread-id`, or `--token-budget` when the user provided them or the local task context clearly supplies them. Prefer `--true-goal` for normal Goalkeeper starts so the contract records a Codex thread id and can later support app-server pause/resume/watch. Use `goalkeeper start "<objective>" --assume-defaults --true-goal` only when the user accepts the recommended defaults. Use contract-only mode only when true goal-control is unavailable or the user asks for a paste-ready contract only. Use `--sdk-run` only when the user explicitly wants a normal Codex SDK thread run and understands that this is not native `/goal` mode.
 
 5. After start, run:
 

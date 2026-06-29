@@ -9,7 +9,12 @@ from pathlib import Path
 
 from .calibration import calibrate_objective
 from .codex_adapter import CodexAppServerJsonRpcAdapter, DryRunCodexAdapter, PythonSdkCodexAdapter
-from .contract import compact_contract_summary, paste_ready_goal, render_contract
+from .contract import (
+    DEFAULT_MAX_GOAL_OBJECTIVE_CHARS,
+    compact_contract_summary,
+    paste_ready_goal,
+    render_contract,
+)
 from .doctor import collect_doctor_report, render_doctor_report
 from .ledger import GoalkeeperStore, new_checkpoint_id, utc_now
 from .models import Checkpoint, CommandRun, Decision, GoalkeeperContract
@@ -42,8 +47,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_calibration_options(prepare)
     prepare.set_defaults(func=cmd_prepare)
 
-    start = sub.add_parser("start", help="Prepare and optionally start a supervised Codex goal.")
-    start.add_argument("objective")
+    start = sub.add_parser("start", help="Prepare or load and optionally start a supervised Codex goal.")
+    start.add_argument("objective", nargs="?")
+    start.add_argument("--contract-id")
     _add_calibration_options(start)
     start.add_argument("--thread-id")
     start.add_argument("--dry-run", action="store_true")
@@ -95,6 +101,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     attach.set_defaults(func=cmd_attach)
 
+    answer = sub.add_parser("answer", help="Answer pending Goalkeeper contract questions.")
+    answer.add_argument("--contract-id", required=True)
+    answer.add_argument(
+        "--answer",
+        action="append",
+        required=True,
+        help="Question answer in Q_ID=value form. Repeat for multiple answers.",
+    )
+    answer.add_argument("--cwd")
+    answer.set_defaults(func=cmd_answer)
+
     checkpoint = sub.add_parser("checkpoint", help="Append a manual checkpoint.")
     checkpoint.add_argument("--contract-id", required=True)
     checkpoint.add_argument("--claimed-progress", default="")
@@ -116,13 +133,19 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--cwd")
     status.set_defaults(func=cmd_status)
 
-    pause = sub.add_parser("pause", help="Mark a contract paused and attempt SDK pause if possible.")
+    pause = sub.add_parser(
+        "pause",
+        help="Mark a contract paused and attempt app-server goal pause when a thread id is known.",
+    )
     pause.add_argument("--contract-id", required=True)
     pause.add_argument("--thread-id")
     pause.add_argument("--cwd")
     pause.set_defaults(func=cmd_pause)
 
-    resume = sub.add_parser("resume", help="Mark a contract active and attempt SDK resume if possible.")
+    resume = sub.add_parser(
+        "resume",
+        help="Mark a contract active and attempt app-server goal resume when a thread id is known.",
+    )
     resume.add_argument("--contract-id", required=True)
     resume.add_argument("--thread-id")
     resume.add_argument("--cwd")
@@ -130,6 +153,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="Inspect local Goalkeeper and Codex integration support.")
     doctor.add_argument("--cwd")
+    doctor.add_argument(
+        "--live-probe",
+        action="store_true",
+        help="Run a side-effectful app-server goal probe to verify true goal-control.",
+    )
     doctor.set_defaults(func=cmd_doctor)
 
     install_skill = sub.add_parser("install-skill", help="Show or perform personal Codex skill install.")
@@ -146,28 +174,71 @@ def _add_calibration_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--questions", type=int, default=3)
     parser.add_argument("--max-no-progress-turns", type=int, default=3)
     parser.add_argument("--max-same-error-retries", type=int, default=2)
+    parser.add_argument(
+        "--max-goal-chars",
+        type=int,
+        default=DEFAULT_MAX_GOAL_OBJECTIVE_CHARS,
+        help="Maximum inline goal objective length before falling back to a contract file reference.",
+    )
+    parser.add_argument(
+        "--assume-defaults",
+        action="store_true",
+        help="Convert generated critical questions into assumptions using recommended defaults.",
+    )
 
 
 def cmd_prepare(args: argparse.Namespace) -> int:
-    contract, path = _prepare_contract(args)
-    print(_format_prepare_output(contract, path))
+    contract, path, assumed_defaults = _prepare_contract(args)
+    print(
+        _format_prepare_output(
+            contract,
+            path,
+            assumed_defaults=assumed_defaults,
+            max_goal_chars=args.max_goal_chars,
+        )
+    )
     return 0
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    contract, path = _prepare_contract(args)
-    contract.thread_id = args.thread_id
     store = GoalkeeperStore(args.cwd)
+    contract, path, assumed_defaults, loaded_existing = _contract_for_start(args, store)
+    if args.thread_id:
+        contract.thread_id = args.thread_id
+    if args.token_budget is not None:
+        contract.token_budget = args.token_budget
     store.save_contract(contract)
-    print(_format_prepare_output(contract, path))
+    if loaded_existing:
+        print(
+            _format_loaded_contract_output(
+                contract,
+                path,
+                assumed_defaults=assumed_defaults,
+                max_goal_chars=args.max_goal_chars,
+            )
+        )
+    else:
+        print(
+            _format_prepare_output(
+                contract,
+                path,
+                assumed_defaults=assumed_defaults,
+                max_goal_chars=args.max_goal_chars,
+            )
+        )
 
     if _has_critical_questions(contract):
-        print("\nStart deferred: answer the critical Goalkeeper question(s), then run start again with the clarified objective.")
+        print(
+            "\nStart deferred: answer the critical Goalkeeper question(s), then run "
+            "`goalkeeper answer --contract-id <id> --answer Q_ID=value`, or rerun with "
+            "--assume-defaults."
+        )
         return 2
 
-    prompt = paste_ready_goal(contract, contract_path=path)
+    token_budget = args.token_budget if args.token_budget is not None else contract.token_budget
+    prompt = paste_ready_goal(contract, contract_path=path, max_chars=args.max_goal_chars)
     if args.dry_run:
-        result = DryRunCodexAdapter(prompt).start_goal(args.thread_id or "", render_contract(contract), args.token_budget)
+        result = DryRunCodexAdapter(prompt).start_goal(args.thread_id or "", render_contract(contract), token_budget)
         print(f"\nDry run: {result.message}")
         print("\nPaste-ready Codex goal:")
         print(prompt)
@@ -175,19 +246,20 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     if args.app_server_goal:
         adapter = CodexAppServerJsonRpcAdapter(cwd=args.cwd)
-        objective = _app_server_goal_objective(contract, path)
+        objective = _app_server_goal_objective(contract, path, max_chars=args.max_goal_chars)
         if args.thread_id:
-            result = adapter.start_goal(args.thread_id, objective, args.token_budget)
+            result = adapter.start_goal(args.thread_id, objective, token_budget)
         else:
             result = adapter.start_goal_thread(
                 objective,
                 cwd=args.cwd,
-                token_budget=args.token_budget,
+                token_budget=token_budget,
             )
         print(f"\nApp-server true goal mode: {result.message}")
         if result.thread_id:
             contract.thread_id = result.thread_id
-            contract.goal_id = result.goal_id or result.thread_id
+            if result.goal_id:
+                contract.goal_id = result.goal_id
             store.save_contract(contract)
             print(f"Thread id: {result.thread_id}")
         if result.final_response:
@@ -210,7 +282,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 sdk_prompt,
                 thread_id=args.thread_id,
                 cwd=args.cwd,
-                token_budget=args.token_budget,
+                token_budget=token_budget,
             )
             print(f"\nSDK run mode: {result.message}")
             if result.thread_id:
@@ -240,10 +312,11 @@ def cmd_start(args: argparse.Namespace) -> int:
                 print("\nFallback: paste this into Codex:")
                 print(prompt)
                 return 0
-            result = adapter.start_goal(args.thread_id, render_contract(contract), args.token_budget)
+            result = adapter.start_goal(args.thread_id, render_contract(contract), token_budget)
             print(f"\nSDK start: {result.message}")
             if result.success:
-                contract.goal_id = result.goal_id
+                if result.goal_id:
+                    contract.goal_id = result.goal_id
                 store.save_contract(contract)
                 return 0
         else:
@@ -309,7 +382,8 @@ def cmd_attach(args: argparse.Namespace) -> int:
 
     adapter = CodexAppServerJsonRpcAdapter(cwd=args.cwd)
     objective = _app_server_goal_objective(contract, path)
-    result = adapter.start_goal(args.thread_id, objective, args.token_budget or contract.token_budget)
+    token_budget = args.token_budget if args.token_budget is not None else contract.token_budget
+    result = adapter.start_goal(args.thread_id, objective, token_budget)
     print(f"App-server true goal attach: {result.message}")
     if result.thread_id:
         contract.thread_id = result.thread_id
@@ -327,6 +401,24 @@ def cmd_attach(args: argparse.Namespace) -> int:
     print("Attach metadata was saved, but app-server goal-control did not start.")
     print("Use status/watch to confirm whether a goal is available before relying on auto-pause.")
     return 1
+
+
+def cmd_answer(args: argparse.Namespace) -> int:
+    store = GoalkeeperStore(args.cwd)
+    contract = store.load_contract(args.contract_id)
+    applied = _apply_question_answers(contract, args.answer)
+    if not _has_critical_questions(contract):
+        contract.status = "active"
+    store.save_contract(contract)
+
+    print(f"Recorded {applied} answer(s) for contract {contract.id}.")
+    if _has_critical_questions(contract):
+        remaining = ", ".join(question.id for question in contract.questions if question.critical)
+        print(f"Critical questions still pending: {remaining}")
+    else:
+        print("No critical questions remain.")
+        print(f"Next: goalkeeper start --contract-id {contract.id} --true-goal")
+    return 0
 
 
 def cmd_checkpoint(args: argparse.Namespace) -> int:
@@ -383,7 +475,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(compact_contract_summary(contract))
     print("\nGoal:")
     print(f"- thread id: {thread_id or '(none)'}")
-    print(f"- goal id: {contract.goal_id or '(none)'}")
+    print(f"- goal id: {contract.goal_id or '(unavailable from current app-server response)'}")
     print(f"- contract status: {contract.status}")
     print(f"- auto-pause available: {'yes' if auto_pause_available else 'no'}")
 
@@ -419,6 +511,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("\nApp-server goal state:")
         if app_goal:
             print(f"- thread id: {app_goal.thread_id}")
+            print(f"- goal id: {app_goal.goal_id or '(unavailable from current app-server response)'}")
             print(f"- status: {app_goal.status}")
             print(f"- token budget: {app_goal.token_budget}")
             print(f"- tokens used: {app_goal.tokens_used}")
@@ -478,7 +571,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    print(render_doctor_report(collect_doctor_report(args.cwd)))
+    print(render_doctor_report(collect_doctor_report(args.cwd, live_probe=args.live_probe)))
     return 0
 
 
@@ -503,7 +596,7 @@ def cmd_install_skill(args: argparse.Namespace) -> int:
     return 0
 
 
-def _prepare_contract(args: argparse.Namespace) -> tuple[GoalkeeperContract, Path]:
+def _prepare_contract(args: argparse.Namespace) -> tuple[GoalkeeperContract, Path, int]:
     contract = calibrate_objective(
         args.objective,
         cwd=args.cwd,
@@ -512,13 +605,38 @@ def _prepare_contract(args: argparse.Namespace) -> tuple[GoalkeeperContract, Pat
         max_no_progress_turns=args.max_no_progress_turns,
         max_same_error_retries=args.max_same_error_retries,
     )
+    assumed_defaults = _assume_question_defaults(contract) if args.assume_defaults else 0
     store = GoalkeeperStore(args.cwd)
     path = store.save_contract(contract)
-    return contract, path
+    return contract, path, assumed_defaults
 
 
-def _format_prepare_output(contract: GoalkeeperContract, path: Path) -> str:
-    prompt = paste_ready_goal(contract, contract_path=path)
+def _contract_for_start(
+    args: argparse.Namespace,
+    store: GoalkeeperStore,
+) -> tuple[GoalkeeperContract, Path, int, bool]:
+    if args.contract_id and args.objective:
+        raise ValueError("provide either an objective or --contract-id, not both")
+    if not args.contract_id and not args.objective:
+        raise ValueError("start requires an objective or --contract-id")
+    if args.contract_id:
+        contract = store.load_contract(args.contract_id)
+        assumed_defaults = _assume_question_defaults(contract) if args.assume_defaults else 0
+        if assumed_defaults:
+            store.save_contract(contract)
+        return contract, store.contract_path(contract.id), assumed_defaults, True
+    contract, path, assumed_defaults = _prepare_contract(args)
+    return contract, path, assumed_defaults, False
+
+
+def _format_prepare_output(
+    contract: GoalkeeperContract,
+    path: Path,
+    *,
+    assumed_defaults: int = 0,
+    max_goal_chars: int = DEFAULT_MAX_GOAL_OBJECTIVE_CHARS,
+) -> str:
+    prompt = paste_ready_goal(contract, contract_path=path, max_chars=max_goal_chars)
     question_lines = ["Questions:"]
     if contract.questions:
         for question in contract.questions:
@@ -528,10 +646,14 @@ def _format_prepare_output(contract: GoalkeeperContract, path: Path) -> str:
     else:
         question_lines.append("- None.")
     assumptions = "\n".join(f"- {item}" for item in contract.assumptions)
+    assumed_line = (
+        f"\nAssumed defaults for {assumed_defaults} question(s).\n" if assumed_defaults else ""
+    )
     return f"""Goalkeeper contract prepared
 Contract id: {contract.id}
 Status: {contract.status}
 Saved contract: {path}
+{assumed_line}
 
 Assumptions:
 {assumptions}
@@ -540,6 +662,28 @@ Assumptions:
 
 Generated contract:
 {render_contract(contract)}
+
+Paste-ready Codex goal:
+{prompt}
+"""
+
+
+def _format_loaded_contract_output(
+    contract: GoalkeeperContract,
+    path: Path,
+    *,
+    assumed_defaults: int = 0,
+    max_goal_chars: int = DEFAULT_MAX_GOAL_OBJECTIVE_CHARS,
+) -> str:
+    prompt = paste_ready_goal(contract, contract_path=path, max_chars=max_goal_chars)
+    assumed_line = (
+        f"\nAssumed defaults for {assumed_defaults} question(s).\n" if assumed_defaults else ""
+    )
+    return f"""Goalkeeper contract loaded
+Contract id: {contract.id}
+Status: {contract.status}
+Saved contract: {path}
+{assumed_line}
 
 Paste-ready Codex goal:
 {prompt}
@@ -635,8 +779,9 @@ def _print_best_effort_goal_state(
         with app_adapter:
             goal = app_adapter.get_goal(thread_id)
         if goal:
+            goal_id = f", goal_id={goal.goal_id}" if goal.goal_id else ""
             print(
-                f"App-server goal: status={goal.status}, "
+                f"App-server goal: status={goal.status}{goal_id}, "
                 f"tokens={goal.tokens_used}/{goal.token_budget}"
             )
         else:
@@ -645,15 +790,57 @@ def _print_best_effort_goal_state(
         print(f"App-server goal state unavailable: {exc}")
 
 
-def _app_server_goal_objective(contract: GoalkeeperContract, path: Path) -> str:
+def _app_server_goal_objective(
+    contract: GoalkeeperContract,
+    path: Path,
+    *,
+    max_chars: int = DEFAULT_MAX_GOAL_OBJECTIVE_CHARS,
+) -> str:
     rendered = render_contract(contract)
-    if len(rendered) <= 4000:
+    if len(rendered) <= max_chars:
         return rendered
     absolute = path.expanduser().resolve()
     return (
         f"Read the Goalkeeper contract at {absolute} and pursue it exactly. "
         f"Contract id: {contract.id}. User objective: {contract.raw_user_objective}"
     )
+
+
+def _assume_question_defaults(contract: GoalkeeperContract) -> int:
+    assumed = 0
+    for question in contract.questions:
+        if not question.critical:
+            continue
+        assumption = f"Assumed {question.id} default: {question.recommended_default}"
+        if assumption not in contract.assumptions:
+            contract.assumptions.append(assumption)
+        question.critical = False
+        assumed += 1
+    if not _has_critical_questions(contract):
+        contract.status = "active"
+    return assumed
+
+
+def _apply_question_answers(contract: GoalkeeperContract, answers: list[str]) -> int:
+    questions_by_id = {question.id: question for question in contract.questions}
+    applied = 0
+    for item in answers:
+        if "=" not in item:
+            raise ValueError(f"answer must be in Q_ID=value form: {item}")
+        question_id, value = item.split("=", 1)
+        question_id = question_id.strip()
+        value = value.strip()
+        if not question_id or not value:
+            raise ValueError(f"answer must include a question id and value: {item}")
+        question = questions_by_id.get(question_id)
+        if question is None:
+            raise ValueError(f"unknown question id for this contract: {question_id}")
+        assumption = f"Answered {question_id}: {value}"
+        if assumption not in contract.assumptions:
+            contract.assumptions.append(assumption)
+        question.critical = False
+        applied += 1
+    return applied
 
 
 def _has_critical_questions(contract: GoalkeeperContract) -> bool:
