@@ -56,6 +56,7 @@ class ThreadSnapshot:
 @dataclass
 class GoalState:
     thread_id: str
+    goal_id: str | None = None
     objective: str | None = None
     status: str | None = None
     token_budget: int | None = None
@@ -444,7 +445,7 @@ class CodexAppServerJsonRpcAdapter(CodexAdapter):
                 True,
                 True,
                 "App-server thread/goal/set created an active Codex goal.",
-                goal_id=thread_id,
+                goal_id=goal.goal_id,
                 thread_id=thread_id,
                 mode="true_goal",
                 final_response=_format_goal_state(goal),
@@ -467,7 +468,7 @@ class CodexAppServerJsonRpcAdapter(CodexAdapter):
                 True,
                 True,
                 "App-server created a persisted thread and set an active Codex goal.",
-                goal_id=thread_id,
+                goal_id=goal.goal_id,
                 thread_id=thread_id,
                 mode="true_goal",
                 final_response=_format_goal_state(goal),
@@ -523,10 +524,7 @@ class CodexAppServerJsonRpcAdapter(CodexAdapter):
         return goal
 
     def set_goal_status(self, thread_id: str, status: str) -> GoalState:
-        current = self.get_goal(thread_id)
         params: dict[str, Any] = {"threadId": thread_id, "status": status}
-        if current and current.objective:
-            params["objective"] = current.objective
         result = self.request("thread/goal/set", params)
         goal = _goal_state_from_result(thread_id, result)
         if goal is None:
@@ -724,7 +722,7 @@ def inspect_app_server_capabilities(
     *,
     codex_bin: str | None = None,
     cwd: str | None = None,
-    live_probe: bool = True,
+    live_probe: bool = False,
 ) -> AppServerCapabilityMatrix:
     command = _resolve_codex_command(codex_bin)
     report = AppServerCapabilityMatrix(codex_binary=command)
@@ -733,7 +731,10 @@ def inspect_app_server_capabilities(
         return report
     report.app_server_available = True
     if not live_probe:
-        report.notes.append("Live app-server goal probe was skipped.")
+        report.notes.append(
+            "Live app-server goal probe skipped. Run `goalkeeper doctor --live-probe` "
+            "to verify true goal-control."
+        )
         return report
     adapter = CodexAppServerJsonRpcAdapter(codex_bin=command, cwd=cwd, request_timeout_s=20.0)
     thread_id = None
@@ -797,6 +798,7 @@ def _goal_state_from_result(thread_id: str, result: dict[str, Any]) -> GoalState
         raise RuntimeError(f"Expected goal object, got {raw_goal!r}")
     return GoalState(
         thread_id=str(raw_goal.get("threadId") or thread_id),
+        goal_id=_first_present_string(raw_goal, ("goalId", "goal_id", "id")),
         objective=raw_goal.get("objective"),
         status=raw_goal.get("status"),
         token_budget=raw_goal.get("tokenBudget"),
@@ -807,10 +809,19 @@ def _goal_state_from_result(thread_id: str, result: dict[str, Any]) -> GoalState
 
 
 def _format_goal_state(goal: GoalState) -> str:
+    goal_id = goal.goal_id or "unavailable"
     return (
-        f"thread_id={goal.thread_id}, status={goal.status}, "
+        f"thread_id={goal.thread_id}, goal_id={goal_id}, status={goal.status}, "
         f"token_budget={goal.token_budget}, tokens_used={goal.tokens_used}"
     )
+
+
+def _first_present_string(data: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = data.get(key)
+        if value:
+            return str(value)
+    return None
 
 
 def _public_methods(owner: Any) -> list[str]:

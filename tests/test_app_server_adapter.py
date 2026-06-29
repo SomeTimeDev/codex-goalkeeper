@@ -45,6 +45,8 @@ class FakeStdin:
 
 
 class FakeAppServerProcess:
+    goal_set_payloads = []
+
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
@@ -79,6 +81,7 @@ class FakeAppServerProcess:
         elif method == "thread/goal/get":
             self.stdout.put_json({"id": request_id, "result": {"goal": self.goal}})
         elif method == "thread/goal/set":
+            FakeAppServerProcess.goal_set_payloads.append(dict(params))
             if self.goal is None:
                 self.goal = {
                     "threadId": params["threadId"],
@@ -136,6 +139,7 @@ class FakeAppServerProcess:
 
 
 def test_app_server_adapter_starts_persisted_thread_and_sets_goal():
+    FakeAppServerProcess.goal_set_payloads = []
     adapter = CodexAppServerJsonRpcAdapter(
         codex_bin="codex",
         process_factory=FakeAppServerProcess,
@@ -146,10 +150,12 @@ def test_app_server_adapter_starts_persisted_thread_and_sets_goal():
     assert result.success is True
     assert result.mode == "true_goal"
     assert result.thread_id == "thread_fake"
+    assert result.goal_id is None
     assert "status=active" in result.final_response
 
 
-def test_app_server_adapter_pause_resume_and_read():
+def test_app_server_adapter_pause_resume_status_only_and_read():
+    FakeAppServerProcess.goal_set_payloads = []
     adapter = CodexAppServerJsonRpcAdapter(
         codex_bin="codex",
         process_factory=FakeAppServerProcess,
@@ -165,6 +171,15 @@ def test_app_server_adapter_pause_resume_and_read():
     assert paused.status == "paused"
     assert resumed.status == "active"
     assert snapshot.thread_id == thread_id
+    assert FakeAppServerProcess.goal_set_payloads[0]["objective"] == "objective"
+    assert FakeAppServerProcess.goal_set_payloads[1] == {
+        "threadId": "thread_fake",
+        "status": "paused",
+    }
+    assert FakeAppServerProcess.goal_set_payloads[2] == {
+        "threadId": "thread_fake",
+        "status": "active",
+    }
 
 
 def test_app_server_capability_probe_with_mock_process(monkeypatch):
