@@ -20,6 +20,51 @@ class RepoFacts:
     git_status_summary: str = ""
 
 
+@dataclass
+class GitObservation:
+    head: str
+    changed_files: list[str] = field(default_factory=list)
+
+
+def observe_git_state(cwd: str | Path | None = None) -> GitObservation | None:
+    """Capture the current HEAD hash and dirty paths, or None outside a usable git repo."""
+    root = Path(cwd or Path.cwd()).expanduser().resolve()
+    head = _git_output(root, "rev-parse", "HEAD")
+    if head is None:
+        return None
+    head = head.strip()
+    status = _git_output(root, "status", "--porcelain")
+    if status is None:
+        return GitObservation(head=head)
+    changed: list[str] = []
+    # Porcelain v1: two status chars, one space, then the path. Leading spaces
+    # in the status columns are significant, so the raw line must not be stripped.
+    for line in status.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:] if len(line) > 3 else line
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        changed.append(path.strip().strip('"'))
+    return GitObservation(head=head, changed_files=changed)
+
+
+def _git_output(root: Path, *args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
 def inspect_repository(cwd: str | Path | None = None) -> RepoFacts:
     root = Path(cwd or Path.cwd()).expanduser().resolve()
     facts = RepoFacts(cwd=root, exists=root.exists())

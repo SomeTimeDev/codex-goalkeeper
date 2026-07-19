@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.pytest_tmp/
+.pytest_prove_tmp/
 .ruff_cache/
 .mypy_cache/
 .venv/
@@ -10,6 +12,7 @@ dist/
 build/
 .coverage
 htmlcov/
+demo-output*/
 .goalkeeper/
 .agents/
 .codex/

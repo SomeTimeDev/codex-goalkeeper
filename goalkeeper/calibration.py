@@ -23,6 +23,24 @@ GENERIC_QUESTION_FRAGMENTS = (
     "should i write tests",
 )
 
+# Keyword groups accept English and Turkish objectives. Turkish entries are
+# stems so suffixed forms ("taşıma", "geçişi") still match by substring.
+MIGRATE_WORDS = ("migrate", "migration", "taşı", "geçir", "geçiş")
+AUTH_WORDS = ("auth", "provider", "login", "kimlik", "giriş", "sağlayıcı", "oturum")
+REFACTOR_WORDS = ("refactor", "refaktör", "yeniden düzenle")
+COMPAT_PHRASES = (
+    "without breaking",
+    "backward-compatible",
+    "compatible",
+    "uyumlu",
+    "bozmadan",
+    "kırmadan",
+    "geriye dönük",
+)
+DEPLOY_WORDS = ("deploy", "release", "dağıt", "yayın", "canlıya")
+WAIT_WORDS = ("wait", "bekle")
+DOC_WORDS = ("doc", "readme", "doküman", "döküman", "belge")
+
 
 def calibrate_objective(
     objective: str,
@@ -32,6 +50,9 @@ def calibrate_objective(
     max_questions: int = 3,
     max_no_progress_turns: int = 3,
     max_same_error_retries: int = 2,
+    max_criteria_stall_turns: int = 5,
+    max_checkpoint_gap_minutes: int = 45,
+    extra_criteria: list[str] | None = None,
 ) -> GoalkeeperContract:
     objective = " ".join(objective.strip().split())
     if not objective:
@@ -51,13 +72,15 @@ def calibrate_objective(
         scope=_infer_scope(objective, facts),
         non_goals=_infer_non_goals(objective),
         assumptions=_infer_assumptions(objective, facts),
-        acceptance_criteria=_infer_acceptance_criteria(objective),
+        acceptance_criteria=_build_acceptance_criteria(objective, extra_criteria),
         verification_plan=_infer_verification_plan(facts),
         loop_policy=LoopPolicy(
             max_no_progress_turns=max_no_progress_turns,
             max_same_error_retries=max_same_error_retries,
             max_waiting_turns=2,
             max_plan_only_turns=2,
+            max_criteria_stall_turns=max_criteria_stall_turns,
+            max_checkpoint_gap_minutes=max_checkpoint_gap_minutes,
         ),
         wait_policy=WaitPolicy(
             detect_waiting=True,
@@ -81,6 +104,10 @@ def _normalize_objective(objective: str) -> str:
     return text[0].upper() + text[1:]
 
 
+def _has_word(text: str, word: str) -> bool:
+    return re.search(rf"(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])", text) is not None
+
+
 def _infer_scope(objective: str, facts: RepoFacts) -> list[str]:
     lower = objective.lower()
     scope = [
@@ -92,9 +119,14 @@ def _infer_scope(objective: str, facts: RepoFacts) -> list[str]:
         scope.append(f"Use {facts.cwd} as the workspace root.")
     if facts.has_agents:
         scope.append("Read and respect AGENTS.md or local agent instructions before editing.")
-    if "doc" in lower or "readme" in lower:
+    if any(word in lower for word in DOC_WORDS):
         scope.append("Update the requested documentation and keep commands truthful.")
-    elif any(word in lower for word in ("api", "public", "migration", "migrate", "refactor")):
+    elif (
+        _has_word(lower, "api")
+        or _has_word(lower, "public")
+        or any(word in lower for word in MIGRATE_WORDS)
+        or any(word in lower for word in REFACTOR_WORDS)
+    ):
         scope.append("Update minimal docs or migration notes only when behavior visible to users changes.")
     if facts.test_commands:
         scope.append("Run the inferred verification command(s) when practical.")
@@ -108,7 +140,7 @@ def _infer_non_goals(objective: str) -> list[str]:
         "Do not perform unrelated refactors, dependency swaps, or formatting churn.",
         "Do not mark work complete without current evidence for every acceptance criterion.",
     ]
-    if "without breaking" in lower or "compatible" in lower or "public api" in lower:
+    if any(phrase in lower for phrase in COMPAT_PHRASES) or "public api" in lower:
         non_goals.append("Do not introduce intentional public API or compatibility breaks.")
     if "codex" in lower:
         non_goals.append("Do not modify Codex source or claim native Codex integration unless it exists.")
@@ -132,6 +164,30 @@ def _infer_assumptions(objective: str, facts: RepoFacts) -> list[str]:
     return assumptions
 
 
+def _build_acceptance_criteria(
+    objective: str,
+    extra_criteria: list[str] | None,
+) -> list[AcceptanceCriterion]:
+    criteria = _infer_acceptance_criteria(objective)
+    added = 0
+    for description in extra_criteria or []:
+        text = " ".join(description.strip().split())
+        if not text:
+            continue
+        added += 1
+        criteria.append(
+            AcceptanceCriterion(
+                id=f"AC_U{added}",
+                description=text,
+                evidence_required=(
+                    "Current-state evidence (files, tests, command output) showing this "
+                    "criterion is met."
+                ),
+            )
+        )
+    return criteria
+
+
 def _infer_acceptance_criteria(objective: str) -> list[AcceptanceCriterion]:
     lower = objective.lower()
     criteria = [
@@ -151,7 +207,11 @@ def _infer_acceptance_criteria(objective: str) -> list[AcceptanceCriterion]:
             evidence_required="Diff or status review showing changes are limited to the objective.",
         ),
     ]
-    if any(word in lower for word in ("api", "compatible", "without breaking", "public")):
+    if (
+        _has_word(lower, "api")
+        or _has_word(lower, "public")
+        or any(phrase in lower for phrase in COMPAT_PHRASES)
+    ):
         criteria.insert(
             1,
             AcceptanceCriterion(
@@ -160,7 +220,11 @@ def _infer_acceptance_criteria(objective: str) -> list[AcceptanceCriterion]:
                 evidence_required="Compatibility tests, unchanged public signatures, or migration notes for any approved break.",
             ),
         )
-    if any(word in lower for word in ("ci", "deploy", "release", "wait")):
+    if (
+        _has_word(lower, "ci")
+        or any(word in lower for word in DEPLOY_WORDS)
+        or any(word in lower for word in WAIT_WORDS)
+    ):
         criteria.append(
             AcceptanceCriterion(
                 id="AC_WAIT",
@@ -210,7 +274,9 @@ def _infer_verification_plan(facts: RepoFacts) -> list[VerificationStep]:
 def _infer_questions(objective: str, *, max_questions: int) -> list[Question]:
     lower = objective.lower()
     questions: list[Question] = []
-    if "migrate" in lower and any(word in lower for word in ("auth", "provider", "login")):
+    if any(word in lower for word in MIGRATE_WORDS) and any(
+        word in lower for word in AUTH_WORDS
+    ):
         questions.append(
             Question(
                 id="Q_FALLBACK",
@@ -222,8 +288,8 @@ def _infer_questions(objective: str, *, max_questions: int) -> list[Question]:
                 reason="This changes the migration safety boundary and rollback path.",
             )
         )
-    if "refactor" in lower and not any(
-        phrase in lower for phrase in ("without breaking", "backward-compatible", "compatible")
+    if any(word in lower for word in REFACTOR_WORDS) and not any(
+        phrase in lower for phrase in COMPAT_PHRASES
     ):
         questions.append(
             Question(
@@ -236,7 +302,9 @@ def _infer_questions(objective: str, *, max_questions: int) -> list[Question]:
                 reason="This determines whether compatibility breaks are defects or accepted scope.",
             )
         )
-    if any(word in lower for word in ("api", "public", "sdk")) and "breaking" not in lower:
+    if (
+        _has_word(lower, "api") or _has_word(lower, "public") or _has_word(lower, "sdk")
+    ) and "breaking" not in lower:
         questions.append(
             Question(
                 id="Q_API_SURFACE",
@@ -245,7 +313,7 @@ def _infer_questions(objective: str, *, max_questions: int) -> list[Question]:
                 reason="The answer prevents accidental expansion into unrelated internal APIs.",
             )
         )
-    if any(word in lower for word in ("ci", "deploy", "release")):
+    if _has_word(lower, "ci") or any(word in lower for word in DEPLOY_WORDS):
         questions.append(
             Question(
                 id="Q_WAIT_CONDITION",

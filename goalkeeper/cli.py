@@ -16,10 +16,21 @@ from .contract import (
     render_contract,
 )
 from .doctor import collect_doctor_report, render_doctor_report
+from .filesystem import observe_git_state
 from .ledger import GoalkeeperStore, new_checkpoint_id, utc_now
 from .models import Checkpoint, CommandRun, Decision, GoalkeeperContract
-from .policy import evaluate_policy
+from .policy import PolicyEvaluation, evaluate_policy
+from .proof import (
+    DEFAULT_SCOPEPROOF_TIMEOUT_SECONDS,
+    evaluate_proof_gate,
+    proof_exit_code,
+    run_scopeproof,
+    save_proof_artifacts,
+    scopeproof_command_run,
+    supported_criteria_closures,
+)
 from .prompts import manual_pause_instruction, manual_watch_instructions, skill_install_instructions
+from .verification import DEFAULT_STEP_TIMEOUT_SECONDS, run_verification_plan
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -127,6 +138,89 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint.add_argument("--cwd")
     checkpoint.set_defaults(func=cmd_checkpoint)
 
+    verify = sub.add_parser(
+        "verify",
+        help="Run the contract's verification plan and record an authoritative checkpoint.",
+    )
+    verify.add_argument("--contract-id", required=True)
+    verify.add_argument(
+        "--step",
+        action="append",
+        default=[],
+        help="Run only these verification step ids (e.g. V2). Repeatable.",
+    )
+    verify.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_STEP_TIMEOUT_SECONDS,
+        help="Per-step timeout in seconds.",
+    )
+    verify.add_argument("--cwd")
+    verify.set_defaults(func=cmd_verify)
+
+    prove = sub.add_parser(
+        "prove",
+        help="Collect verification and ScopeProof evidence, then gate the next action.",
+    )
+    prove.add_argument("--contract-id", required=True)
+    prove.add_argument("--base", default="HEAD", help="Base Git ref for ScopeProof.")
+    prove.add_argument("--head", help="Optional head Git ref for ScopeProof.")
+    prove.add_argument(
+        "--step",
+        action="append",
+        default=[],
+        help="Run only these verification step ids. Repeatable.",
+    )
+    prove.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_STEP_TIMEOUT_SECONDS,
+        help="Per-verification-step timeout in seconds.",
+    )
+    prove.add_argument(
+        "--scope-timeout",
+        type=float,
+        default=DEFAULT_SCOPEPROOF_TIMEOUT_SECONDS,
+        help="ScopeProof timeout in seconds.",
+    )
+    prove.add_argument("--scope-config", help="Optional ScopeProof project config path.")
+    prove.add_argument("--scope-task", help="Optional ScopeProof task boundary path.")
+    prove.add_argument(
+        "--allow-path",
+        action="append",
+        default=[],
+        help="Allowed task path when Proofkeeper generates the ScopeProof task file.",
+    )
+    prove.add_argument(
+        "--forbid-path",
+        action="append",
+        default=[],
+        help="Forbidden task path when Proofkeeper generates the ScopeProof task file.",
+    )
+    prove.add_argument(
+        "--prefer-modify",
+        action="append",
+        default=[],
+        help="Existing path that should be modified before adding a new abstraction.",
+    )
+    prove.add_argument(
+        "--close-criterion",
+        action="append",
+        default=[],
+        help="Criterion supported by non-automated evidence in this proof. Repeatable.",
+    )
+    prove.add_argument(
+        "--allow-scope-warn",
+        action="store_true",
+        help="Allow ScopeProof WARN results. FAIL results always block.",
+    )
+    prove.add_argument(
+        "--scopeproof-bin",
+        help="Optional path or command name for the ScopeProof executable.",
+    )
+    prove.add_argument("--cwd")
+    prove.set_defaults(func=cmd_prove)
+
     status = sub.add_parser("status", help="Show contract status and loop risk.")
     status.add_argument("--contract-id", required=True)
     status.add_argument("--thread-id")
@@ -174,6 +268,24 @@ def _add_calibration_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--questions", type=int, default=3)
     parser.add_argument("--max-no-progress-turns", type=int, default=3)
     parser.add_argument("--max-same-error-retries", type=int, default=2)
+    parser.add_argument(
+        "--max-criteria-stall-turns",
+        type=int,
+        default=5,
+        help="Active checkpoints without closing a criterion before drift replan is required.",
+    )
+    parser.add_argument(
+        "--max-checkpoint-gap-minutes",
+        type=int,
+        default=45,
+        help="Minutes an active contract may go without a checkpoint before the ledger is stale.",
+    )
+    parser.add_argument(
+        "--criterion",
+        action="append",
+        default=[],
+        help="Add an objective-specific acceptance criterion (repeatable).",
+    )
     parser.add_argument(
         "--max-goal-chars",
         type=int,
@@ -438,6 +550,7 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
         next_action=args.next_action,
         waiting_on=args.waiting_on,
     )
+    _capture_git_observation(checkpoint, args.cwd)
     _apply_criteria_closures(contract, checkpoint)
     checkpoints = store.read_checkpoints(contract.id)
     evaluation = evaluate_policy(contract, checkpoints + [checkpoint])
@@ -449,10 +562,194 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
         contract.status = "complete"
     store.save_contract(contract)
     print(f"Checkpoint added: {checkpoint.id}")
-    print(f"Decision: {checkpoint.decision.value}")
-    print(f"Progress score: {checkpoint.progress_score}")
-    print(f"Recommendation: {evaluation.explanation}")
+    _print_evaluation(evaluation)
+    _print_contract_anchor(contract, store)
     return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    store = GoalkeeperStore(args.cwd)
+    contract = store.load_contract(args.contract_id)
+    results = run_verification_plan(
+        contract,
+        cwd=args.cwd,
+        step_ids=args.step,
+        timeout=args.timeout,
+    )
+    if not results:
+        print("No verification steps matched the requested step ids.")
+        return 1
+    executed = [result for result in results if result.executed]
+    passed = [result for result in executed if result.outcome == "passed"]
+    failed = [result for result in executed if result.outcome == "failed"]
+    manual = [result for result in results if not result.executed]
+
+    checkpoint = Checkpoint(
+        id=new_checkpoint_id(),
+        contract_id=contract.id,
+        timestamp=utc_now(),
+        claimed_progress=(
+            f"Goalkeeper ran the verification plan: {len(passed)} passed, "
+            f"{len(failed)} failed, {len(manual)} manual."
+        ),
+        new_evidence=[
+            f"{result.step_id} `{result.command}` passed: {result.summary}" for result in passed
+        ],
+        criteria_remaining=[
+            criterion.id
+            for criterion in contract.acceptance_criteria
+            if criterion.status != "satisfied"
+        ],
+        commands_run=[
+            CommandRun(
+                command=result.command or "",
+                outcome=result.outcome,
+                summary=result.summary,
+                error_signature=result.error_signature,
+            )
+            for result in executed
+        ],
+        next_action=(
+            "Fix the first failing verification step with a new hypothesis."
+            if failed
+            else "Close acceptance criteria supported by this verification evidence."
+        ),
+        source="verify",
+    )
+    _capture_git_observation(checkpoint, args.cwd)
+    checkpoints = store.read_checkpoints(contract.id)
+    evaluation = evaluate_policy(contract, checkpoints + [checkpoint])
+    checkpoint.loop_signals = evaluation.signals
+    checkpoint.progress_score = evaluation.progress_score
+    checkpoint.decision = evaluation.decision
+    store.append_checkpoint(checkpoint)
+    store.save_contract(contract)
+
+    print(f"Verification checkpoint added: {checkpoint.id}")
+    for result in results:
+        marker = {"passed": "PASS", "failed": "FAIL"}.get(result.outcome, "SKIP")
+        command = f" `{result.command}`" if result.command else ""
+        print(f"- [{marker}] {result.step_id}{command}: {result.summary}")
+    _print_evaluation(evaluation)
+    _print_contract_anchor(contract, store)
+    return 1 if failed else 0
+
+
+def cmd_prove(args: argparse.Namespace) -> int:
+    store = GoalkeeperStore(args.cwd)
+    contract = store.load_contract(args.contract_id)
+    verification = run_verification_plan(
+        contract,
+        cwd=args.cwd,
+        step_ids=args.step,
+        timeout=args.timeout,
+    )
+    scopeproof = run_scopeproof(
+        contract,
+        cwd=args.cwd,
+        base=args.base,
+        head=args.head,
+        config_path=args.scope_config,
+        task_path=args.scope_task,
+        allowed_paths=_split_values(args.allow_path),
+        forbidden_paths=_split_values(args.forbid_path),
+        prefer_modify=_split_values(args.prefer_modify),
+        allow_warn=args.allow_scope_warn,
+        scopeproof_bin=args.scopeproof_bin,
+        timeout=args.scope_timeout,
+    )
+    criteria_closed = supported_criteria_closures(
+        contract,
+        verification,
+        scopeproof,
+        requested=_split_values(args.close_criterion),
+    )
+    verification_evidence = [
+        f"{item.step_id} `{item.command}` passed: {item.summary}"
+        for item in verification
+        if item.executed and item.outcome == "passed"
+    ]
+    scope_outcome, scope_summary, scope_error = scopeproof_command_run(scopeproof)
+    evidence = [*verification_evidence, f"ScopeProof {scopeproof.summary}"]
+    checkpoint = Checkpoint(
+        id=new_checkpoint_id(),
+        contract_id=contract.id,
+        timestamp=utc_now(),
+        claimed_progress="Proofkeeper collected measured verification and scope evidence.",
+        new_evidence=evidence,
+        criteria_closed=criteria_closed,
+        criteria_remaining=[
+            criterion.id
+            for criterion in contract.acceptance_criteria
+            if criterion.status != "satisfied" and criterion.id not in criteria_closed
+        ],
+        commands_run=[
+            CommandRun(
+                command=item.command or "",
+                outcome=item.outcome,
+                summary=item.summary,
+                error_signature=item.error_signature,
+            )
+            for item in verification
+            if item.executed
+        ]
+        + [
+            CommandRun(
+                command=scopeproof.command,
+                outcome=scope_outcome,
+                summary=scope_summary,
+                error_signature=scope_error,
+            )
+        ],
+        changed_files=list(scopeproof.changed_files),
+        source="prove",
+    )
+    _capture_git_observation(checkpoint, args.cwd)
+    _apply_criteria_closures(contract, checkpoint)
+    checkpoints = store.read_checkpoints(contract.id)
+    policy = evaluate_policy(contract, checkpoints + [checkpoint])
+    gate = evaluate_proof_gate(contract, verification, scopeproof, policy)
+    checkpoint.claimed_progress += f" Gate: {gate.label}."
+    checkpoint.next_action = gate.reason
+    checkpoint.loop_signals = gate.signals
+    checkpoint.progress_score = policy.progress_score
+    checkpoint.decision = gate.decision
+    store.append_checkpoint(checkpoint)
+    if gate.decision == Decision.COMPLETE_CANDIDATE:
+        contract.status = "complete"
+    store.save_contract(contract)
+    artifacts = save_proof_artifacts(
+        store,
+        contract,
+        checkpoint,
+        verification,
+        scopeproof,
+        gate,
+        base=args.base,
+        head=args.head,
+    )
+
+    print(f"Proofkeeper gate: {gate.label}")
+    print(f"Reason: {gate.reason}")
+    print("\nVerification:")
+    if verification:
+        for item in verification:
+            marker = {"passed": "PASS", "failed": "FAIL"}.get(item.outcome, "SKIP")
+            command = f" `{item.command}`" if item.command else ""
+            print(f"- [{marker}] {item.step_id}{command}: {item.summary}")
+    else:
+        print("- No verification steps matched.")
+    print("\nScopeProof:")
+    print(f"- [{scopeproof.status}] {scopeproof.summary}")
+    print(f"- config: {scopeproof.config_source}; task boundary: {scopeproof.task_source}")
+    for item in scopeproof.checks:
+        status = str(item.get("status", "UNKNOWN")).upper()
+        print(f"- [{status}] {item.get('check_id', 'unknown')}: {item.get('summary', '')}")
+    print("\nEvidence bundle:")
+    print(f"- JSON: {artifacts.json_path}")
+    print(f"- Markdown: {artifacts.markdown_path}")
+    _print_contract_anchor(contract, store)
+    return proof_exit_code(gate)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -502,6 +799,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"- no-evidence streak: {evaluation.no_evidence_streak}")
     print(f"- same-error retries: {evaluation.same_error_retries}")
     print(f"- waiting streak: {evaluation.waiting_streak}")
+    print(f"- criteria-stall streak: {evaluation.criteria_stall_streak}")
+    if evaluation.checkpoint_gap_minutes is not None:
+        print(f"- minutes since last checkpoint: {evaluation.checkpoint_gap_minutes:.0f}")
     print(f"- recommendation: {evaluation.explanation}")
     if evaluation.signals:
         print("- signals:")
@@ -596,6 +896,37 @@ def cmd_install_skill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _capture_git_observation(checkpoint: Checkpoint, cwd: str | None) -> None:
+    observation = observe_git_state(cwd)
+    if observation is None:
+        return
+    checkpoint.git_head = observation.head
+    checkpoint.observed_changed_files = observation.changed_files
+
+
+def _print_evaluation(evaluation: PolicyEvaluation) -> None:
+    print(f"Decision: {evaluation.decision.value}")
+    print(f"Progress score: {evaluation.progress_score}")
+    print(f"Recommendation: {evaluation.explanation}")
+    for signal in evaluation.signals:
+        print(f"Signal: {signal.kind} ({signal.severity}): {signal.explanation}")
+
+
+def _print_contract_anchor(contract: GoalkeeperContract, store: GoalkeeperStore) -> None:
+    open_criteria = [
+        criterion for criterion in contract.acceptance_criteria if criterion.status != "satisfied"
+    ]
+    print("\nContract anchor:")
+    print(f"- objective: {contract.normalized_objective}")
+    if open_criteria:
+        for criterion in open_criteria:
+            print(f"- open {criterion.id}: {criterion.description}")
+    else:
+        print("- open criteria: none")
+    print(f"- contract file: {store.contract_path(contract.id)}")
+    print("Re-read the contract file before the next turn if the goal context feels stale.")
+
+
 def _prepare_contract(args: argparse.Namespace) -> tuple[GoalkeeperContract, Path, int]:
     contract = calibrate_objective(
         args.objective,
@@ -604,6 +935,9 @@ def _prepare_contract(args: argparse.Namespace) -> tuple[GoalkeeperContract, Pat
         max_questions=args.questions,
         max_no_progress_turns=args.max_no_progress_turns,
         max_same_error_retries=args.max_same_error_retries,
+        max_criteria_stall_turns=args.max_criteria_stall_turns,
+        max_checkpoint_gap_minutes=args.max_checkpoint_gap_minutes,
+        extra_criteria=args.criterion,
     )
     assumed_defaults = _assume_question_defaults(contract) if args.assume_defaults else 0
     store = GoalkeeperStore(args.cwd)

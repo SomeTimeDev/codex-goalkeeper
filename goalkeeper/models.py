@@ -86,6 +86,8 @@ class LoopPolicy:
     max_same_error_retries: int = 2
     max_waiting_turns: int = 2
     max_plan_only_turns: int = 2
+    max_criteria_stall_turns: int = 5
+    max_checkpoint_gap_minutes: int = 45
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LoopPolicy:
@@ -94,6 +96,8 @@ class LoopPolicy:
             max_same_error_retries=int(data.get("max_same_error_retries", 2)),
             max_waiting_turns=int(data.get("max_waiting_turns", 2)),
             max_plan_only_turns=int(data.get("max_plan_only_turns", 2)),
+            max_criteria_stall_turns=int(data.get("max_criteria_stall_turns", 5)),
+            max_checkpoint_gap_minutes=int(data.get("max_checkpoint_gap_minutes", 45)),
         )
 
 
@@ -214,6 +218,9 @@ class Checkpoint:
     loop_signals: list[LoopSignal] = field(default_factory=list)
     progress_score: int = 0
     decision: Decision = Decision.CONTINUE
+    source: str = "manual"
+    observed_changed_files: list[str] = field(default_factory=list)
+    git_head: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -239,4 +246,7 @@ class Checkpoint:
             loop_signals=[LoopSignal.from_dict(item) for item in data.get("loop_signals", [])],
             progress_score=int(data.get("progress_score", 0)),
             decision=Decision(decision_value),
+            source=str(data.get("source", "manual")),
+            observed_changed_files=list(data.get("observed_changed_files", [])),
+            git_head=data.get("git_head"),
         )

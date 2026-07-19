@@ -64,3 +64,39 @@ def test_verification_inference_for_cargo(tmp_path):
     facts = inspect_repository(tmp_path)
 
     assert "cargo test" in facts.test_commands
+
+
+def test_turkish_migration_objective_triggers_fallback_question(tmp_path):
+    contract = calibrate_objective("auth sağlayıcısını yeni sisteme taşı", cwd=tmp_path)
+
+    assert any(question.id == "Q_FALLBACK" for question in contract.questions)
+
+
+def test_turkish_compat_phrase_adds_compat_criterion(tmp_path):
+    contract = calibrate_objective(
+        "faturalama modülünü mevcut davranışı bozmadan yeniden düzenle",
+        cwd=tmp_path,
+    )
+
+    assert any(criterion.id == "AC_COMPAT" for criterion in contract.acceptance_criteria)
+    assert not any(question.id == "Q_COMPAT" for question in contract.questions)
+
+
+def test_short_tokens_do_not_match_inside_words(tmp_path):
+    contract = calibrate_objective("add specific circuit breaker handling", cwd=tmp_path)
+
+    assert not any(question.id == "Q_WAIT_CONDITION" for question in contract.questions)
+    assert not any(criterion.id == "AC_WAIT" for criterion in contract.acceptance_criteria)
+
+
+def test_custom_criteria_are_appended(tmp_path):
+    contract = calibrate_objective(
+        "add health endpoint",
+        cwd=tmp_path,
+        extra_criteria=["GET /health returns 200", "  ", "Latency stays under 50ms"],
+    )
+
+    ids = [criterion.id for criterion in contract.acceptance_criteria]
+    assert "AC_U1" in ids
+    assert "AC_U2" in ids
+    assert not any(criterion.id == "AC_U3" for criterion in contract.acceptance_criteria)
