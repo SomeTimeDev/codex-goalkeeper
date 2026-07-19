@@ -20,6 +20,15 @@ from .filesystem import observe_git_state
 from .ledger import GoalkeeperStore, new_checkpoint_id, utc_now
 from .models import Checkpoint, CommandRun, Decision, GoalkeeperContract
 from .policy import PolicyEvaluation, evaluate_policy
+from .proof import (
+    DEFAULT_SCOPEPROOF_TIMEOUT_SECONDS,
+    evaluate_proof_gate,
+    proof_exit_code,
+    run_scopeproof,
+    save_proof_artifacts,
+    scopeproof_command_run,
+    supported_criteria_closures,
+)
 from .prompts import manual_pause_instruction, manual_watch_instructions, skill_install_instructions
 from .verification import DEFAULT_STEP_TIMEOUT_SECONDS, run_verification_plan
 
@@ -148,6 +157,69 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify.add_argument("--cwd")
     verify.set_defaults(func=cmd_verify)
+
+    prove = sub.add_parser(
+        "prove",
+        help="Collect verification and ScopeProof evidence, then gate the next action.",
+    )
+    prove.add_argument("--contract-id", required=True)
+    prove.add_argument("--base", default="HEAD", help="Base Git ref for ScopeProof.")
+    prove.add_argument("--head", help="Optional head Git ref for ScopeProof.")
+    prove.add_argument(
+        "--step",
+        action="append",
+        default=[],
+        help="Run only these verification step ids. Repeatable.",
+    )
+    prove.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_STEP_TIMEOUT_SECONDS,
+        help="Per-verification-step timeout in seconds.",
+    )
+    prove.add_argument(
+        "--scope-timeout",
+        type=float,
+        default=DEFAULT_SCOPEPROOF_TIMEOUT_SECONDS,
+        help="ScopeProof timeout in seconds.",
+    )
+    prove.add_argument("--scope-config", help="Optional ScopeProof project config path.")
+    prove.add_argument("--scope-task", help="Optional ScopeProof task boundary path.")
+    prove.add_argument(
+        "--allow-path",
+        action="append",
+        default=[],
+        help="Allowed task path when Proofkeeper generates the ScopeProof task file.",
+    )
+    prove.add_argument(
+        "--forbid-path",
+        action="append",
+        default=[],
+        help="Forbidden task path when Proofkeeper generates the ScopeProof task file.",
+    )
+    prove.add_argument(
+        "--prefer-modify",
+        action="append",
+        default=[],
+        help="Existing path that should be modified before adding a new abstraction.",
+    )
+    prove.add_argument(
+        "--close-criterion",
+        action="append",
+        default=[],
+        help="Criterion supported by non-automated evidence in this proof. Repeatable.",
+    )
+    prove.add_argument(
+        "--allow-scope-warn",
+        action="store_true",
+        help="Allow ScopeProof WARN results. FAIL results always block.",
+    )
+    prove.add_argument(
+        "--scopeproof-bin",
+        help="Optional path or command name for the ScopeProof executable.",
+    )
+    prove.add_argument("--cwd")
+    prove.set_defaults(func=cmd_prove)
 
     status = sub.add_parser("status", help="Show contract status and loop risk.")
     status.add_argument("--contract-id", required=True)
@@ -561,6 +633,123 @@ def cmd_verify(args: argparse.Namespace) -> int:
     _print_evaluation(evaluation)
     _print_contract_anchor(contract, store)
     return 1 if failed else 0
+
+
+def cmd_prove(args: argparse.Namespace) -> int:
+    store = GoalkeeperStore(args.cwd)
+    contract = store.load_contract(args.contract_id)
+    verification = run_verification_plan(
+        contract,
+        cwd=args.cwd,
+        step_ids=args.step,
+        timeout=args.timeout,
+    )
+    scopeproof = run_scopeproof(
+        contract,
+        cwd=args.cwd,
+        base=args.base,
+        head=args.head,
+        config_path=args.scope_config,
+        task_path=args.scope_task,
+        allowed_paths=_split_values(args.allow_path),
+        forbidden_paths=_split_values(args.forbid_path),
+        prefer_modify=_split_values(args.prefer_modify),
+        allow_warn=args.allow_scope_warn,
+        scopeproof_bin=args.scopeproof_bin,
+        timeout=args.scope_timeout,
+    )
+    criteria_closed = supported_criteria_closures(
+        contract,
+        verification,
+        scopeproof,
+        requested=_split_values(args.close_criterion),
+    )
+    verification_evidence = [
+        f"{item.step_id} `{item.command}` passed: {item.summary}"
+        for item in verification
+        if item.executed and item.outcome == "passed"
+    ]
+    scope_outcome, scope_summary, scope_error = scopeproof_command_run(scopeproof)
+    evidence = [*verification_evidence, f"ScopeProof {scopeproof.summary}"]
+    checkpoint = Checkpoint(
+        id=new_checkpoint_id(),
+        contract_id=contract.id,
+        timestamp=utc_now(),
+        claimed_progress="Proofkeeper collected measured verification and scope evidence.",
+        new_evidence=evidence,
+        criteria_closed=criteria_closed,
+        criteria_remaining=[
+            criterion.id
+            for criterion in contract.acceptance_criteria
+            if criterion.status != "satisfied" and criterion.id not in criteria_closed
+        ],
+        commands_run=[
+            CommandRun(
+                command=item.command or "",
+                outcome=item.outcome,
+                summary=item.summary,
+                error_signature=item.error_signature,
+            )
+            for item in verification
+            if item.executed
+        ]
+        + [
+            CommandRun(
+                command=scopeproof.command,
+                outcome=scope_outcome,
+                summary=scope_summary,
+                error_signature=scope_error,
+            )
+        ],
+        changed_files=list(scopeproof.changed_files),
+        source="prove",
+    )
+    _capture_git_observation(checkpoint, args.cwd)
+    _apply_criteria_closures(contract, checkpoint)
+    checkpoints = store.read_checkpoints(contract.id)
+    policy = evaluate_policy(contract, checkpoints + [checkpoint])
+    gate = evaluate_proof_gate(contract, verification, scopeproof, policy)
+    checkpoint.claimed_progress += f" Gate: {gate.label}."
+    checkpoint.next_action = gate.reason
+    checkpoint.loop_signals = gate.signals
+    checkpoint.progress_score = policy.progress_score
+    checkpoint.decision = gate.decision
+    store.append_checkpoint(checkpoint)
+    if gate.decision == Decision.COMPLETE_CANDIDATE:
+        contract.status = "complete"
+    store.save_contract(contract)
+    artifacts = save_proof_artifacts(
+        store,
+        contract,
+        checkpoint,
+        verification,
+        scopeproof,
+        gate,
+        base=args.base,
+        head=args.head,
+    )
+
+    print(f"Proofkeeper gate: {gate.label}")
+    print(f"Reason: {gate.reason}")
+    print("\nVerification:")
+    if verification:
+        for item in verification:
+            marker = {"passed": "PASS", "failed": "FAIL"}.get(item.outcome, "SKIP")
+            command = f" `{item.command}`" if item.command else ""
+            print(f"- [{marker}] {item.step_id}{command}: {item.summary}")
+    else:
+        print("- No verification steps matched.")
+    print("\nScopeProof:")
+    print(f"- [{scopeproof.status}] {scopeproof.summary}")
+    print(f"- config: {scopeproof.config_source}; task boundary: {scopeproof.task_source}")
+    for item in scopeproof.checks:
+        status = str(item.get("status", "UNKNOWN")).upper()
+        print(f"- [{status}] {item.get('check_id', 'unknown')}: {item.get('summary', '')}")
+    print("\nEvidence bundle:")
+    print(f"- JSON: {artifacts.json_path}")
+    print(f"- Markdown: {artifacts.markdown_path}")
+    _print_contract_anchor(contract, store)
+    return proof_exit_code(gate)
 
 
 def cmd_status(args: argparse.Namespace) -> int:

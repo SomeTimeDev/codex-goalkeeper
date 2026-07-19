@@ -1,11 +1,19 @@
-# Goalkeeper
+# Proofkeeper
 
-A small safety layer for big Codex goals.
+### Evidence-first runtime supervision for Codex
 
-Goalkeeper is a standalone personal companion for long-running Codex `/goal`
-work. It takes a normal objective, turns it into a compact contract, asks only
-the questions that matter, records checkpoints, and watches for loops before
-they turn into wasted hours.
+Proofkeeper combines Goalkeeper's long-running goal contracts with ScopeProof's
+deterministic diff checks. Codex may continue working only after the current
+state produces measured verification and scope evidence.
+
+One command runs the closed evidence loop:
+
+```bash
+goalkeeper prove --contract-id gk_example --base HEAD
+```
+
+It returns exactly one gate: **CONTINUE**, **REPLAN**, **PAUSE**, or
+**COMPLETE**, and saves the evidence behind that decision as JSON and Markdown.
 
 Think of it as a seatbelt and flight recorder for Codex goals: quiet most of
 the time, very useful when the work starts drifting.
@@ -13,9 +21,10 @@ the time, very useful when the work starts drifting.
 Goalkeeper is not a fork of Codex. It does not patch Codex source. This MVP
 does not add a native `/goalkeeper` slash command.
 
-This is alpha software. It is useful, but intentionally conservative:
+The installed CLI remains `goalkeeper`; Proofkeeper is its proof mode and
+Build Week product surface. This is alpha software and intentionally conservative:
 true goal-control depends on local Codex app-server behavior, and supervision
-quality depends on checkpoints being recorded.
+fails closed when verification or ScopeProof evidence is unavailable.
 
 ```bash
 goalkeeper start "refactor billing module without breaking public API" --true-goal
@@ -24,18 +33,32 @@ goalkeeper start "refactor billing module without breaking public API" --true-go
 If true Codex goal-control is unavailable, Goalkeeper still produces a
 paste-ready `/goal` contract. Contract-only mode always works.
 
-## What Is Goalkeeper?
+```mermaid
+flowchart LR
+    A["Codex goal"] --> B["Goalkeeper contract"]
+    B --> C["Codex works"]
+    C --> D["goalkeeper prove"]
+    D --> E["Measured verification"]
+    D --> F["ScopeProof diff checks"]
+    E --> G{"Evidence gate"}
+    F --> G
+    G -->|"evidence is current"| H["CONTINUE / COMPLETE"]
+    G -->|"tests fail or scope drifts"| I["REPLAN"]
+    G -->|"evidence unavailable"| J["PAUSE"]
+```
 
-Goalkeeper is a Python CLI that helps Codex goals stay aligned with evidence.
+## What Is Proofkeeper?
 
-It does five simple things:
+Proofkeeper is a Python CLI that makes a Codex goal earn its next action with evidence.
+
+It does six things:
 
 - turns an objective into a verifiable goal contract,
 - stores that contract and a compact checkpoint ledger,
 - gives Codex a checkpoint rule to follow during long-running work,
-- runs the contract's verification plan itself (`goalkeeper verify`) so command
-  outcomes are measured, not self-reported,
-- recommends continue, replan, pause, or defer when progress stops being real.
+- runs the contract's verification plan itself so outcomes are measured,
+- checks Git changes with ScopeProof for scope escape and architectural drift,
+- saves a reproducible evidence bundle and gates the next action.
 
 The point is not to replace Codex `/goal`. The point is to make `/goal` easier
 to trust when the job is long, fuzzy, or expensive to get wrong.
@@ -73,6 +96,12 @@ For development:
 
 ```bash
 python -m pip install -e ".[dev]"
+```
+
+Install Proofkeeper with ScopeProof integration:
+
+```bash
+python -m pip install -e ".[proof]"
 ```
 
 For optional Codex SDK experiments:
@@ -130,11 +159,18 @@ goalkeeper checkpoint --contract-id gk_example \
   --next-action "Review public API compatibility"
 ```
 
-Let Goalkeeper measure instead of trusting claims:
+Let Proofkeeper measure verification, inspect scope, and gate continuation:
 
 ```bash
-goalkeeper verify --contract-id gk_example
+goalkeeper prove --contract-id gk_example --base HEAD \
+  --allow-path "goalkeeper/**" \
+  --allow-path "tests/**" \
+  --close-criterion AC1
 ```
+
+If the repository already contains `scopeproof.yml` and `.scopeproof/task.yml`,
+Proofkeeper uses them. Otherwise it generates a strict temporary policy; use
+`--allow-path` to provide explicit task boundaries.
 
 Watch once, using the ledger as the source of truth:
 
@@ -144,6 +180,40 @@ goalkeeper watch --contract-id gk_example --once
 
 If true goal-control is unavailable, Goalkeeper prints the exact `/goal ...`
 text to paste into Codex.
+
+## Two-Minute Demo
+
+The demo creates a disposable Git repository and runs two real proof gates:
+
+1. a focused calculator change whose tests and scope checks pass (`COMPLETE`),
+2. the same passing tests plus an unrelated service layer (`REPLAN`).
+
+```bash
+python examples/run_proofkeeper_demo.py
+```
+
+The script copies both JSON and Markdown evidence bundles to a new ignored
+`demo-output-<id>/` directory. It requires the development and proof extras:
+
+```bash
+python -m pip install -e ".[dev,proof]"
+```
+
+## Built With Codex During Build Week
+
+Goalkeeper existed before OpenAI Build Week. The competition extension is the
+Proofkeeper layer: the `prove` command, ScopeProof adapter, versioned evidence
+bundles, four-way gate, runnable demo, and the upstream fix that stops test
+functions from being treated as duplicate production abstractions.
+
+Codex accelerated repository analysis, implementation, regression coverage, and
+the real end-to-end proof runs. Product decisions remained explicit: missing scope
+evidence must pause, an objective criterion cannot be inferred from green tests,
+and the first failing integration result was repaired rather than bypassed.
+
+See [the Build Week submission draft](docs/BUILD_WEEK_SUBMISSION.md) for the
+pre-existing/new-work boundary, judging narrative, and under-three-minute video
+script.
 
 ## CLI Usage
 
@@ -274,6 +344,25 @@ the claim is flagged as `unverified_file_claim`.
 After recording, the command prints the decision plus a contract anchor: the
 normalized objective, the open acceptance criteria, and the contract file
 path. This re-injects the goal into the agent's context on every turn.
+
+### `goalkeeper prove --contract-id <id>`
+
+Runs the verification plan and ScopeProof in one fail-closed gate. Passing test
+evidence can close `AC2`; a clean ScopeProof report can close `AC3`. The
+objective criterion `AC1` stays explicit because tests and a tidy diff do not,
+by themselves, prove that the requested behavior was implemented.
+
+```bash
+goalkeeper prove --contract-id gk_abc123 --base HEAD \
+  --allow-path "src/**" \
+  --allow-path "tests/**" \
+  --close-criterion AC1
+```
+
+Evidence is saved under `.goalkeeper/proofs/<contract-id>/` as both JSON and
+Markdown. Exit code `0` means CONTINUE or COMPLETE, `2` means REPLAN, and `3`
+means PAUSE. ScopeProof warnings block by default; `--allow-scope-warn` is an
+explicit opt-out for projects that deliberately use advisory warnings.
 
 ### `goalkeeper verify --contract-id <id>`
 
@@ -569,8 +658,10 @@ into checkpoints unless you want it persisted locally.
   succeeds.
 - Watch mode is best-effort around Codex thread reading.
 - Supervisor decisions depend on checkpoints. A silent ledger is now flagged
-  (`checkpoint_gap`) and `goalkeeper verify` measures command outcomes
-  directly, but the quality of free-text evidence claims is still not judged.
+  (`checkpoint_gap`), while `goalkeeper prove` measures command outcomes and
+  scope directly. Explicit criterion closure still requires operator judgment.
+- Generated ScopeProof policy cannot infer business-specific path boundaries;
+  use project config or repeatable `--allow-path` and `--forbid-path` flags.
 - Calibration is deterministic and conservative. It does not call external LLM
   APIs. Use `--criterion` to add objective-specific acceptance criteria.
 - Loop detection is explainable but imperfect.
@@ -579,7 +670,7 @@ into checkpoints unless you want it persisted locally.
 
 - richer checkpoint extraction from Codex thread events,
 - stronger repository-aware verification inference,
-- optional report generation under `.goalkeeper/reports/`,
+- signed or attestable proof bundles,
 - configurable storage roots,
 - richer app-server event monitoring,
 - better packaging for personal Codex skill distribution,

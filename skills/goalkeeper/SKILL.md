@@ -1,6 +1,6 @@
 ---
 name: goalkeeper
-description: Use Goalkeeper to prepare, start, checkpoint, and supervise long-running Codex goals from a local standalone CLI. Trigger on phrases like "Use Goalkeeper for:", "Goalkeeper:", or "Run goalkeeper on this objective:".
+description: Use Goalkeeper and Proofkeeper proof mode to prepare, start, checkpoint, prove, and supervise long-running Codex goals from a local standalone CLI. Trigger on phrases like "Use Goalkeeper for:", "Goalkeeper:", or "Run goalkeeper on this objective:".
 ---
 
 # Goalkeeper Skill
@@ -60,13 +60,19 @@ Goalkeeper is a standalone personal companion tool. It does not add a native `/g
 
    Before each checkpoint, re-read the contract file at `.goalkeeper/contracts/<id>.json` and check that the current work maps to an open acceptance criterion. If it does not, stop and replan instead of continuing.
 
-   For command outcomes, prefer letting Goalkeeper measure instead of self-reporting:
+   For continuation decisions, prefer the closed proof gate over self-reporting:
 
    ```bash
-   goalkeeper verify --contract-id <id>
+   goalkeeper prove --contract-id <id> --base HEAD
    ```
 
-   `verify` runs the contract's verification plan itself and records an authoritative checkpoint with real command results. Goalkeeper also snapshots git state at every checkpoint; claimed file changes that are not visible in git are flagged as `unverified_file_claim`.
+   `prove` runs the contract's verification plan, checks the diff with ScopeProof,
+   writes a JSON/Markdown evidence bundle, and returns CONTINUE, REPLAN, PAUSE,
+   or COMPLETE. Treat missing ScopeProof or behavioral verification as PAUSE;
+   never bypass the gate by converting absent evidence into a pass. Use
+   `goalkeeper verify --contract-id <id>` only for a narrower command-only check.
+   Goalkeeper also snapshots git state at every checkpoint; claimed file changes
+   that are not visible in git are flagged as `unverified_file_claim`.
 
    Or ask the user to run:
 

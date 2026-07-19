@@ -12,6 +12,7 @@ from goalkeeper.codex_adapter import AppServerCapabilityMatrix, PauseGoalResult,
 from goalkeeper.contract import DEFAULT_MAX_GOAL_OBJECTIVE_CHARS
 from goalkeeper.ledger import GoalkeeperStore, new_checkpoint_id, utc_now
 from goalkeeper.models import Checkpoint, VerificationStep
+from goalkeeper.proof import ScopeProofOutcome
 
 
 def _first_contract_id(tmp_path):
@@ -116,6 +117,85 @@ def test_verify_returns_nonzero_on_failing_step(tmp_path, capsys):
     assert "[FAIL] V1" in output
     assert checkpoints[-1].commands_run[0].outcome == "failed"
     assert checkpoints[-1].commands_run[0].error_signature
+
+
+def test_prove_closes_supported_criteria_and_writes_evidence_bundle(
+    tmp_path, capsys, monkeypatch
+):
+    assert main(["prepare", "add health endpoint", "--cwd", str(tmp_path)]) == 0
+    contract_id = _first_contract_id(tmp_path)
+    store = GoalkeeperStore(tmp_path)
+    contract = store.load_contract(contract_id)
+    contract.verification_plan = [
+        VerificationStep(id="V3", description="Echo.", command="echo ok", expected_signal="ok"),
+    ]
+    store.save_contract(contract)
+    monkeypatch.setattr(
+        "goalkeeper.cli.run_scopeproof",
+        lambda *args, **kwargs: ScopeProofOutcome(
+            status="PASS",
+            summary="PASS: 2 changed file(s), 7 check(s)",
+            command="scopeproof check --base HEAD --format json",
+            changed_files=["goalkeeper/proof.py", "tests/test_proof.py"],
+            blocks_gate=False,
+        ),
+    )
+
+    result = main(
+        [
+            "prove",
+            "--contract-id",
+            contract_id,
+            "--cwd",
+            str(tmp_path),
+            "--close-criterion",
+            "AC1",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    updated = store.load_contract(contract_id)
+    checkpoints = store.read_checkpoints(contract_id)
+    latest = tmp_path / ".goalkeeper" / "proofs" / contract_id / "latest.json"
+    payload = json.loads(latest.read_text(encoding="utf-8"))
+    assert result == 0
+    assert "Proofkeeper gate: COMPLETE" in output
+    assert updated.status == "complete"
+    assert all(item.status == "satisfied" for item in updated.acceptance_criteria)
+    assert checkpoints[-1].source == "prove"
+    assert checkpoints[-1].decision.value == "complete_candidate"
+    assert payload["gate"]["decision"] == "COMPLETE"
+    assert payload["verification"]["status"] == "PASS"
+    assert payload["scopeproof"]["status"] == "PASS"
+
+
+def test_prove_fails_closed_when_scopeproof_is_unavailable(tmp_path, capsys, monkeypatch):
+    assert main(["prepare", "add health endpoint", "--cwd", str(tmp_path)]) == 0
+    contract_id = _first_contract_id(tmp_path)
+    store = GoalkeeperStore(tmp_path)
+    contract = store.load_contract(contract_id)
+    contract.verification_plan = [
+        VerificationStep(id="V3", description="Echo.", command="echo ok", expected_signal="ok"),
+    ]
+    store.save_contract(contract)
+    monkeypatch.setattr(
+        "goalkeeper.cli.run_scopeproof",
+        lambda *args, **kwargs: ScopeProofOutcome(
+            status="UNAVAILABLE",
+            summary="ScopeProof is not installed.",
+            command="scopeproof check --base HEAD --format json",
+            error="not found",
+        ),
+    )
+
+    result = main(["prove", "--contract-id", contract_id, "--cwd", str(tmp_path)])
+
+    output = capsys.readouterr().out
+    checkpoint = store.read_checkpoints(contract_id)[-1]
+    assert result == 3
+    assert "Proofkeeper gate: PAUSE" in output
+    assert checkpoint.decision.value == "pause_recommended"
+    assert any(signal.kind == "proof_scopeproof_unavailable" for signal in checkpoint.loop_signals)
 
 
 def test_prepare_with_custom_criterion(tmp_path):

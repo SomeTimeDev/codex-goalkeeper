@@ -61,3 +61,21 @@ def test_run_verification_plan_step_filter(tmp_path):
     assert [result.step_id for result in results] == ["V2"]
     assert results[0].outcome == "passed"
     assert contract.verification_plan[0].last_result is None
+
+
+def test_success_summary_prefers_stdout_over_nonfatal_stderr(tmp_path, monkeypatch):
+    class Completed:
+        returncode = 0
+        stdout = "2 files changed, 9 insertions\n"
+        stderr = "line-ending warning\n"
+
+    monkeypatch.setattr("goalkeeper.verification.subprocess.run", lambda *args, **kwargs: Completed())
+    contract = make_contract_with_steps(
+        tmp_path,
+        [VerificationStep(id="V1", description="Diff.", command="git diff --stat")],
+    )
+
+    result = run_verification_plan(contract, cwd=tmp_path)[0]
+
+    assert result.outcome == "passed"
+    assert result.summary == "2 files changed, 9 insertions"

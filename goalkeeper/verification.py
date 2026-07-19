@@ -96,8 +96,8 @@ def _run_step(
             summary=f"Could not run command: {exc}",
             error_signature=_truncate(f"oserror: {command}", _SIGNATURE_MAX_CHARS),
         )
-    tail = _last_meaningful_line(result.stdout, result.stderr)
     if result.returncode == 0:
+        tail = _last_meaningful_line(result.stdout, result.stderr)
         return VerificationOutcome(
             step_id=step_id,
             description=description,
@@ -105,6 +105,7 @@ def _run_step(
             outcome="passed",
             summary=_truncate(tail or "exit 0", _SUMMARY_MAX_CHARS),
         )
+    tail = _last_meaningful_line(result.stderr, result.stdout)
     return VerificationOutcome(
         step_id=step_id,
         description=description,
@@ -117,8 +118,8 @@ def _run_step(
     )
 
 
-def _last_meaningful_line(stdout: str, stderr: str) -> str:
-    for stream in (stderr, stdout):
+def _last_meaningful_line(*streams: str) -> str:
+    for stream in streams:
         lines = [line.strip() for line in (stream or "").splitlines() if line.strip()]
         if lines:
             return lines[-1]

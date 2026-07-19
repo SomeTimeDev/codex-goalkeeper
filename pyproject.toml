@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "goalkeeper"
-version = "0.1.0"
-description = "A standalone personal Codex companion for supervising long-running goals."
+version = "0.2.0"
+description = "Evidence-first runtime supervision for long-running Codex goals."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Goalkeeper contributors" }]
-keywords = ["codex", "goals", "automation", "supervision", "cli"]
+keywords = ["codex", "goals", "evidence", "scope", "supervision", "cli"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -25,6 +25,7 @@ dependencies = []
 
 [project.optional-dependencies]
 codex = ["openai-codex>=0.1.0b3"]
+proof = ["scopeproof @ git+https://github.com/SomeTimeDev/scopeproof.git"]
 dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]

@@ -87,9 +87,13 @@ Do not end a goal continuation turn without either:
 - explaining why no checkpoint could be recorded.
 
 Verification rule:
-Prefer `goalkeeper verify --contract-id {contract.id}` over self-reporting command outcomes.
-It runs the contract's verification plan itself and records an authoritative checkpoint with real results.
-Goalkeeper also snapshots git state at each checkpoint; claimed file changes that are not visible in git are flagged as unverified.
+Prefer `goalkeeper prove --contract-id {contract.id} --base HEAD` over self-reporting
+command outcomes. Proof mode runs the contract's verification plan, checks the diff
+with ScopeProof, saves a machine-readable evidence bundle, and returns one gate:
+CONTINUE, REPLAN, PAUSE, or COMPLETE.
+Use `goalkeeper verify --contract-id {contract.id}` only when scope evidence is not
+needed. Goalkeeper also snapshots git state at each checkpoint; claimed file changes
+that are not visible in git are flagged as unverified.
 
 Re-anchor rule:
 Before recording each checkpoint, re-read this contract at .goalkeeper/contracts/{contract.id}.json.
