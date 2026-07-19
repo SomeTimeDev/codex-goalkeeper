@@ -1,13 +1,17 @@
 import json
 import importlib.resources
+import shutil
+import subprocess
 from types import SimpleNamespace
+
+import pytest
 
 from goalkeeper.calibration import calibrate_objective
 from goalkeeper.cli import _app_server_goal_objective, main
 from goalkeeper.codex_adapter import AppServerCapabilityMatrix, PauseGoalResult, StartGoalResult
 from goalkeeper.contract import DEFAULT_MAX_GOAL_OBJECTIVE_CHARS
 from goalkeeper.ledger import GoalkeeperStore, new_checkpoint_id, utc_now
-from goalkeeper.models import Checkpoint
+from goalkeeper.models import Checkpoint, VerificationStep
 
 
 def _first_contract_id(tmp_path):
@@ -66,7 +70,112 @@ def test_checkpoint_appends_ledger(tmp_path, capsys):
     output = capsys.readouterr().out
     assert result == 0
     assert "Checkpoint added:" in output
+    assert "Contract anchor:" in output
     assert (tmp_path / ".goalkeeper" / "ledgers" / f"{contract_id}.jsonl").exists()
+
+
+def test_verify_records_authoritative_checkpoint(tmp_path, capsys):
+    assert main(["prepare", "add health endpoint", "--cwd", str(tmp_path)]) == 0
+    contract_id = _first_contract_id(tmp_path)
+    store = GoalkeeperStore(tmp_path)
+    contract = store.load_contract(contract_id)
+    contract.verification_plan = [
+        VerificationStep(id="V1", description="Echo.", command="echo ok", expected_signal="ok"),
+    ]
+    store.save_contract(contract)
+
+    result = main(["verify", "--contract-id", contract_id, "--cwd", str(tmp_path)])
+
+    output = capsys.readouterr().out
+    checkpoints = store.read_checkpoints(contract_id)
+    updated = store.load_contract(contract_id)
+    assert result == 0
+    assert "Verification checkpoint added:" in output
+    assert "[PASS] V1" in output
+    assert "Contract anchor:" in output
+    assert checkpoints[-1].source == "verify"
+    assert any("passed" in item for item in checkpoints[-1].new_evidence)
+    assert updated.verification_plan[0].last_result.startswith("passed")
+
+
+def test_verify_returns_nonzero_on_failing_step(tmp_path, capsys):
+    assert main(["prepare", "add health endpoint", "--cwd", str(tmp_path)]) == 0
+    contract_id = _first_contract_id(tmp_path)
+    store = GoalkeeperStore(tmp_path)
+    contract = store.load_contract(contract_id)
+    contract.verification_plan = [
+        VerificationStep(id="V1", description="Fails.", command="exit 2", expected_signal="never"),
+    ]
+    store.save_contract(contract)
+
+    result = main(["verify", "--contract-id", contract_id, "--cwd", str(tmp_path)])
+
+    output = capsys.readouterr().out
+    checkpoints = store.read_checkpoints(contract_id)
+    assert result == 1
+    assert "[FAIL] V1" in output
+    assert checkpoints[-1].commands_run[0].outcome == "failed"
+    assert checkpoints[-1].commands_run[0].error_signature
+
+
+def test_prepare_with_custom_criterion(tmp_path):
+    result = main(
+        [
+            "prepare",
+            "add health endpoint",
+            "--cwd",
+            str(tmp_path),
+            "--criterion",
+            "GET /health returns 200 with build info",
+        ]
+    )
+
+    contract = GoalkeeperStore(tmp_path).load_contract(_first_contract_id(tmp_path))
+    assert result == 0
+    custom = [item for item in contract.acceptance_criteria if item.id == "AC_U1"]
+    assert custom
+    assert "returns 200" in custom[0].description
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not available")
+def test_checkpoint_captures_git_observation(tmp_path, capsys):
+    def git(*args):
+        subprocess.run(
+            ["git", "-C", str(tmp_path), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git("init")
+    (tmp_path / "tracked.txt").write_text("one", encoding="utf-8")
+    git("add", ".")
+    git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-m", "init")
+    (tmp_path / "tracked.txt").write_text("two", encoding="utf-8")
+
+    assert main(["prepare", "add health endpoint", "--cwd", str(tmp_path)]) == 0
+    contract_id = _first_contract_id(tmp_path)
+
+    result = main(
+        [
+            "checkpoint",
+            "--contract-id",
+            contract_id,
+            "--cwd",
+            str(tmp_path),
+            "--claimed-progress",
+            "Edited tracked file",
+            "--evidence",
+            "manual edit",
+            "--changed-file",
+            "tracked.txt",
+        ]
+    )
+
+    checkpoints = GoalkeeperStore(tmp_path).read_checkpoints(contract_id)
+    assert result == 0
+    assert checkpoints[-1].git_head
+    assert "tracked.txt" in checkpoints[-1].observed_changed_files
 
 
 def test_watch_once_without_sdk_prints_manual_instructions(tmp_path, capsys):

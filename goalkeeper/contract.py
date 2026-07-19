@@ -53,6 +53,8 @@ Loop policy:
 - Do not spend more than {contract.loop_policy.max_no_progress_turns} consecutive goal turns without new evidence.
 - If no new evidence is produced, replan before continuing.
 - If no new evidence is produced for the configured limit, pause or ask for user input.
+- If {contract.loop_policy.max_criteria_stall_turns} active turns produce work but close no acceptance criterion, treat it as scope drift: stop, re-read this contract, and replan against the criteria.
+- Record a checkpoint at least every {contract.loop_policy.max_checkpoint_gap_minutes} minutes while the goal is active, or explain the silence.
 - Do not broaden scope merely to keep working.
 - Avoid unrelated refactors.
 
@@ -83,6 +85,16 @@ If the goal is waiting, include `--waiting-on "CI, approval, user input, deploym
 Do not end a goal continuation turn without either:
 - recording a goalkeeper checkpoint, or
 - explaining why no checkpoint could be recorded.
+
+Verification rule:
+Prefer `goalkeeper verify --contract-id {contract.id}` over self-reporting command outcomes.
+It runs the contract's verification plan itself and records an authoritative checkpoint with real results.
+Goalkeeper also snapshots git state at each checkpoint; claimed file changes that are not visible in git are flagged as unverified.
+
+Re-anchor rule:
+Before recording each checkpoint, re-read this contract at .goalkeeper/contracts/{contract.id}.json.
+Compare your current work against the acceptance criteria and non-goals.
+If the current work does not map to an open acceptance criterion, stop and replan instead of continuing.
 
 Stale context defense:
 - Before repeating a previous manual steer or subtask, check the Goalkeeper contract and checkpoint history.

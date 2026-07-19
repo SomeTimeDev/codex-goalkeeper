@@ -31,6 +31,19 @@ def test_contract_generation_includes_required_sections(tmp_path):
     assert "Pause/defer and record the wake condition" in rendered
 
 
+def test_contract_includes_reanchor_and_verify_rules(tmp_path):
+    contract = calibrate_objective("add audit logging", cwd=tmp_path)
+
+    rendered = render_contract(contract)
+
+    assert "Verification rule:" in rendered
+    assert f"goalkeeper verify --contract-id {contract.id}" in rendered
+    assert "Re-anchor rule:" in rendered
+    assert f".goalkeeper/contracts/{contract.id}.json" in rendered
+    assert "scope drift" in rendered
+    assert "Record a checkpoint at least every" in rendered
+
+
 def test_paste_ready_goal_below_limit_contains_inline_contract(tmp_path):
     contract = calibrate_objective("add audit logging", cwd=tmp_path)
     max_chars = len(f"/goal {render_contract(contract)}") + 1

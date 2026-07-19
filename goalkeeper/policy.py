@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from .models import Checkpoint, Decision, GoalkeeperContract, LoopSignal
+
+
+SAME_ERROR_WINDOW = 10
 
 
 @dataclass
@@ -14,10 +18,38 @@ class PolicyEvaluation:
     no_evidence_streak: int = 0
     same_error_retries: int = 0
     waiting_streak: int = 0
+    criteria_stall_streak: int = 0
+    checkpoint_gap_minutes: float | None = None
 
 
-def evaluate_policy(contract: GoalkeeperContract, checkpoints: list[Checkpoint]) -> PolicyEvaluation:
+def evaluate_policy(
+    contract: GoalkeeperContract,
+    checkpoints: list[Checkpoint],
+    *,
+    now: datetime | None = None,
+) -> PolicyEvaluation:
+    now = now or datetime.now(UTC)
+    gap_limit = contract.loop_policy.max_checkpoint_gap_minutes
+
     if not checkpoints:
+        gap = _minutes_since(contract.updated_at, now) if contract.status == "active" else None
+        if gap is not None and gap > gap_limit:
+            signal = LoopSignal(
+                kind="checkpoint_gap",
+                severity="high",
+                explanation=(
+                    "The contract is active but no checkpoint has been recorded for "
+                    f"{gap:.0f} minutes. The goal may have stopped reporting or stalled silently."
+                ),
+                evidence=[f"last contract update: {contract.updated_at}"],
+            )
+            return PolicyEvaluation(
+                decision=Decision.ASK_USER,
+                progress_score=0,
+                signals=[signal],
+                explanation="Active contract with a stale ledger; confirm the goal is still running and checkpoint it.",
+                checkpoint_gap_minutes=gap,
+            )
         return PolicyEvaluation(
             decision=Decision.CONTINUE,
             progress_score=0,
@@ -32,8 +64,49 @@ def evaluate_policy(contract: GoalkeeperContract, checkpoints: list[Checkpoint])
     same_error_retries = _count_same_error_retries(checkpoints)
     waiting_streak = _count_waiting_streak(checkpoints)
     plan_only_streak = _count_plan_only_streak(checkpoints)
+    criteria_stall_streak = _count_criteria_stall_streak(checkpoints)
     repeated_command = _latest_repeated_command(checkpoints)
     churned_files = _latest_file_churn(checkpoints)
+    unverified_claims = _unverified_file_claims(checkpoints)
+    gap = _minutes_since(latest.timestamp, now) if contract.status == "active" else None
+
+    if gap is not None and gap > gap_limit:
+        signals.append(
+            LoopSignal(
+                kind="checkpoint_gap",
+                severity="high",
+                explanation=(
+                    f"No checkpoint for {gap:.0f} minutes on an active contract "
+                    f"(limit: {gap_limit} minutes). Ledger findings below may be stale."
+                ),
+                evidence=[f"last checkpoint: {latest.timestamp}"],
+            )
+        )
+        return PolicyEvaluation(
+            decision=Decision.ASK_USER,
+            progress_score=score,
+            signals=signals,
+            explanation="The ledger is stale; confirm the goal is still running before trusting any streak.",
+            no_evidence_streak=no_evidence_streak,
+            same_error_retries=same_error_retries,
+            waiting_streak=waiting_streak,
+            criteria_stall_streak=criteria_stall_streak,
+            checkpoint_gap_minutes=gap,
+        )
+
+    if unverified_claims:
+        score -= 2
+        signals.append(
+            LoopSignal(
+                kind="unverified_file_claim",
+                severity="high",
+                explanation=(
+                    "Claimed changed files are not visible in the working tree and the git HEAD "
+                    "did not move since the previous checkpoint. The claim could not be verified."
+                ),
+                evidence=unverified_claims,
+            )
+        )
 
     if repeated_command:
         score -= 1
@@ -52,7 +125,10 @@ def evaluate_policy(contract: GoalkeeperContract, checkpoints: list[Checkpoint])
             LoopSignal(
                 kind="same_error_repeated",
                 severity="high",
-                explanation="The same error signature repeated beyond the configured retry limit.",
+                explanation=(
+                    "The same error signature keeps recurring beyond the configured retry limit, "
+                    "including alternating retries."
+                ),
                 evidence=[str(same_error_retries)],
             )
         )
@@ -64,6 +140,8 @@ def evaluate_policy(contract: GoalkeeperContract, checkpoints: list[Checkpoint])
             no_evidence_streak=no_evidence_streak,
             same_error_retries=same_error_retries,
             waiting_streak=waiting_streak,
+            criteria_stall_streak=criteria_stall_streak,
+            checkpoint_gap_minutes=gap,
         )
 
     if waiting_streak >= contract.loop_policy.max_waiting_turns:
@@ -89,6 +167,8 @@ def evaluate_policy(contract: GoalkeeperContract, checkpoints: list[Checkpoint])
             no_evidence_streak=no_evidence_streak,
             same_error_retries=same_error_retries,
             waiting_streak=waiting_streak,
+            criteria_stall_streak=criteria_stall_streak,
+            checkpoint_gap_minutes=gap,
         )
 
     if no_evidence_streak >= contract.loop_policy.max_no_progress_turns:
@@ -109,6 +189,36 @@ def evaluate_policy(contract: GoalkeeperContract, checkpoints: list[Checkpoint])
             no_evidence_streak=no_evidence_streak,
             same_error_retries=same_error_retries,
             waiting_streak=waiting_streak,
+            criteria_stall_streak=criteria_stall_streak,
+            checkpoint_gap_minutes=gap,
+        )
+
+    if criteria_stall_streak >= contract.loop_policy.max_criteria_stall_turns:
+        score -= 2
+        signals.append(
+            LoopSignal(
+                kind="criteria_stalled",
+                severity="high",
+                explanation=(
+                    "Sustained activity (files, commands, evidence) without closing any acceptance "
+                    "criterion. This is the scope-drift pattern: motion that does not map to the goal."
+                ),
+                evidence=[str(criteria_stall_streak)],
+            )
+        )
+        return PolicyEvaluation(
+            decision=Decision.REPLAN_REQUIRED,
+            progress_score=score,
+            signals=signals,
+            explanation=(
+                "Activity is not closing acceptance criteria; replan against the contract "
+                "criteria before continuing."
+            ),
+            no_evidence_streak=no_evidence_streak,
+            same_error_retries=same_error_retries,
+            waiting_streak=waiting_streak,
+            criteria_stall_streak=criteria_stall_streak,
+            checkpoint_gap_minutes=gap,
         )
 
     if plan_only_streak >= contract.loop_policy.max_plan_only_turns:
@@ -142,6 +252,8 @@ def evaluate_policy(contract: GoalkeeperContract, checkpoints: list[Checkpoint])
             no_evidence_streak=no_evidence_streak,
             same_error_retries=same_error_retries,
             waiting_streak=waiting_streak,
+            criteria_stall_streak=criteria_stall_streak,
+            checkpoint_gap_minutes=gap,
         )
 
     if score <= -4:
@@ -153,6 +265,8 @@ def evaluate_policy(contract: GoalkeeperContract, checkpoints: list[Checkpoint])
             no_evidence_streak=no_evidence_streak,
             same_error_retries=same_error_retries,
             waiting_streak=waiting_streak,
+            criteria_stall_streak=criteria_stall_streak,
+            checkpoint_gap_minutes=gap,
         )
 
     if latest.criteria_closed or latest.new_evidence:
@@ -164,6 +278,8 @@ def evaluate_policy(contract: GoalkeeperContract, checkpoints: list[Checkpoint])
             no_evidence_streak=no_evidence_streak,
             same_error_retries=same_error_retries,
             waiting_streak=waiting_streak,
+            criteria_stall_streak=criteria_stall_streak,
+            checkpoint_gap_minutes=gap,
         )
 
     return PolicyEvaluation(
@@ -174,6 +290,8 @@ def evaluate_policy(contract: GoalkeeperContract, checkpoints: list[Checkpoint])
         no_evidence_streak=no_evidence_streak,
         same_error_retries=same_error_retries,
         waiting_streak=waiting_streak,
+        criteria_stall_streak=criteria_stall_streak,
+        checkpoint_gap_minutes=gap,
     )
 
 
@@ -192,9 +310,24 @@ def score_checkpoint(checkpoint: Checkpoint) -> int:
         score -= 2
     if checkpoint.waiting_on:
         score -= 3
-    if _is_plan_only(checkpoint):
-        score += 0
     return score
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _minutes_since(timestamp: str, now: datetime) -> float | None:
+    parsed = _parse_timestamp(timestamp)
+    if parsed is None:
+        return None
+    return max((now - parsed).total_seconds() / 60.0, 0.0)
 
 
 def _has_new_evidence(checkpoint: Checkpoint) -> bool:
@@ -253,16 +386,30 @@ def _count_plan_only_streak(checkpoints: list[Checkpoint]) -> int:
     return count
 
 
+def _count_criteria_stall_streak(checkpoints: list[Checkpoint]) -> int:
+    count = 0
+    for checkpoint in reversed(checkpoints):
+        if checkpoint.criteria_closed:
+            break
+        has_activity = bool(
+            checkpoint.changed_files or checkpoint.new_evidence or checkpoint.commands_run
+        )
+        if not has_activity:
+            break
+        count += 1
+    return count
+
+
 def _count_same_error_retries(checkpoints: list[Checkpoint]) -> int:
     latest_signature = None
-    count = 0
     for command in reversed(checkpoints[-1].commands_run):
         if command.error_signature:
             latest_signature = command.error_signature
             break
     if latest_signature is None:
         return 0
-    for checkpoint in reversed(checkpoints):
+    count = 0
+    for checkpoint in reversed(checkpoints[-SAME_ERROR_WINDOW:]):
         signatures = [
             command.error_signature
             for command in checkpoint.commands_run
@@ -270,7 +417,7 @@ def _count_same_error_retries(checkpoints: list[Checkpoint]) -> int:
         ]
         if latest_signature in signatures:
             count += 1
-        else:
+        elif checkpoint.criteria_closed:
             break
     return count
 
@@ -297,6 +444,35 @@ def _latest_file_churn(checkpoints: list[Checkpoint]) -> list[str]:
     before_previous = set(checkpoints[-3].changed_files)
     churned = sorted(latest & previous & before_previous)
     return churned
+
+
+def _unverified_file_claims(checkpoints: list[Checkpoint]) -> list[str]:
+    latest = checkpoints[-1]
+    if not latest.changed_files or latest.git_head is None or len(checkpoints) < 2:
+        return []
+    previous = checkpoints[-2]
+    if previous.git_head is None or previous.git_head != latest.git_head:
+        return []
+    observed = {_normalize_path(item) for item in latest.observed_changed_files}
+    unverified = []
+    for claim in latest.changed_files:
+        normalized = _normalize_path(claim)
+        supported = any(
+            normalized == candidate
+            or candidate.endswith(f"/{normalized}")
+            or normalized.endswith(f"/{candidate}")
+            for candidate in observed
+        )
+        if not supported:
+            unverified.append(claim)
+    return unverified
+
+
+def _normalize_path(path: str) -> str:
+    normalized = path.strip().replace("\\", "/").lower()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.strip("/")
 
 
 def _all_criteria_satisfied(contract: GoalkeeperContract) -> bool:

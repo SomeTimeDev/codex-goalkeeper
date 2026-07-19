@@ -58,13 +58,23 @@ Goalkeeper is a standalone personal companion tool. It does not add a native `/g
 
    The generated Goalkeeper contract contains the exact checkpoint command shape. Do not let a long-running goal continuation end without either recording a checkpoint or explaining why no checkpoint could be recorded.
 
+   Before each checkpoint, re-read the contract file at `.goalkeeper/contracts/<id>.json` and check that the current work maps to an open acceptance criterion. If it does not, stop and replan instead of continuing.
+
+   For command outcomes, prefer letting Goalkeeper measure instead of self-reporting:
+
+   ```bash
+   goalkeeper verify --contract-id <id>
+   ```
+
+   `verify` runs the contract's verification plan itself and records an authoritative checkpoint with real command results. Goalkeeper also snapshots git state at every checkpoint; claimed file changes that are not visible in git are flagged as `unverified_file_claim`.
+
    Or ask the user to run:
 
    ```bash
    goalkeeper watch --contract-id <id> --auto-pause --true-goal
    ```
 
-8. Respect Goalkeeper recommendations. If it says `replan_required`, stop repeating the same failure and make a new hypothesis. If it says `pause_recommended` or `defer_recommended`, pause or ask the user instead of continuing low-value turns.
+8. Respect Goalkeeper recommendations. If it says `replan_required`, stop repeating the same failure and make a new hypothesis; the `criteria_stalled` signal means activity is not closing acceptance criteria (scope drift) — replan against the contract criteria. If it says `pause_recommended` or `defer_recommended`, pause or ask the user instead of continuing low-value turns. If it says `ask_user` with a `checkpoint_gap` signal, the ledger is stale: confirm the goal state and record a fresh checkpoint before continuing.
 
 ## Important Boundaries
 
